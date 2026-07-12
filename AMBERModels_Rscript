@@ -1,24 +1,19 @@
 
-
-### R Script #########
-# got chat gpt to tidy this lol
 #### ============================================================
-#### FINAL INVERTEBRATE BARRIER MODELS
+#### RUN ONE FINAL INVERTEBRATE MODEL
+#### ============================================================
+#### Usage:
+####   Rscript Scripts/run_one_A1_A2_A3_model.R A1i_Richnesswithtype
 ####
-#### Fits two Bayesian multilevel models:
-####   1. Taxon richness model
-####   2. Proportion of non-native taxa model
-####
-#### Expected input files:
-####   - invert_richness_final_barrier_type_reduced.rds
-####   - invert_prop_final_barrier_type_reduced.rds
+#### Valid model names:
+####   A1i_Richnesswithtype
+####   A1ii_Richnesswithouttype
+####   A2i_Shannonwithtype
+####   A2ii_Shannonwithouttype
+####   A3i_Propwithtype
+####   A3ii_Propwithouttype
 #### ============================================================
 
-
-#### 1. Packages and settings ------------------------------------
-
-# This library path is specific to the Kelvin2 setup.
-# Remove or change it when running on another computer or cluster.
 .libPaths(c("~/Rlibs", .libPaths()))
 
 library(brms)
@@ -26,240 +21,198 @@ library(dplyr)
 library(posterior)
 library(bayesplot)
 library(ggplot2)
+library(readr)
 
 options(mc.cores = 4)
-rstan::rstan_options(auto_write = TRUE)
+rstan_options(auto_write = TRUE)
 
-set.seed(1200)
+#### 0. Get model name ##########################################
 
+args <- commandArgs(trailingOnly = TRUE)
 
-#### 2. File paths -----------------------------------------------
+if (length(args) != 1) {
+  stop("You must provide exactly one model name.")
+}
+
+model_name <- args[1]
+
+valid_models <- c(
+  "A1i_Richnesswithtype",
+  "A1ii_Richnesswithouttype",
+  "A2i_Shannonwithtype",
+  "A2ii_Shannonwithouttype",
+  "A3i_Propwithtype",
+  "A3ii_Propwithouttype"
+)
+
+if (!model_name %in% valid_models) {
+  stop(
+    "Invalid model name: ", model_name,
+    "\nValid options are:\n",
+    paste(valid_models, collapse = "\n")
+  )
+}
+
+cat("\n============================================================\n")
+cat("Running model:", model_name, "\n")
+cat("============================================================\n")
+
+#### 1. Folders ##################################################
 
 data_dir <- "Data/Processed/Final_Invert_Models"
-out_dir  <- "completed_models/final_invert_barrier_models"
+base_out_dir <- "completed_models/A1_A2_A3_separate_models"
+out_dir <- file.path(base_out_dir, model_name)
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-richness_file <- file.path(
-  data_dir,
-  "invert_richness_final_barrier_type_reduced.rds"
-)
+#### 2. Helper functions ########################################
 
-prop_file <- file.path(
-  data_dir,
-  "invert_prop_final_barrier_type_reduced.rds"
-)
-
-
-#### 3. Load input data ------------------------------------------
-
-richness_data <- readRDS(richness_file)
-prop_data     <- readRDS(prop_file)
-
-
-#### 4. Check required columns -----------------------------------
-
-richness_required <- c(
-  "value",
-  "community_group",
-  "barrier_type_reduced",
-  "z_barrier_density",
-  "z_dist_up",
-  "z_dist_down",
-  "z_dist_mouth",
-  "z_log_population_density",
-  "z_mean_temp_annual",
-  "z_precip_annual",
-  "z_log_river_km",
-  "country",
-  "HYBAS_ID",
-  "site_id",
-  "method",
-  "sample_year"
-)
-
-prop_required <- c(
-  "non_native",
-  "total_taxa",
-  "barrier_type_reduced",
-  "z_barrier_density",
-  "z_dist_up",
-  "z_dist_down",
-  "z_dist_mouth",
-  "z_log_population_density",
-  "z_mean_temp_annual",
-  "z_precip_annual",
-  "z_log_river_km",
-  "country",
-  "HYBAS_ID",
-  "site_id",
-  "method",
-  "sample_year"
-)
-
-check_required_columns <- function(data, required_columns, data_name) {
-  missing_columns <- setdiff(required_columns, names(data))
-
-  if (length(missing_columns) > 0) {
-    stop(
-      data_name,
-      " is missing these required columns: ",
-      paste(missing_columns, collapse = ", ")
-    )
+check_file <- function(path) {
+  if (!file.exists(path)) {
+    stop("File not found: ", path)
   }
 }
 
-check_required_columns(
-  richness_data,
-  richness_required,
-  "richness_data"
-)
+save_model_outputs <- function(model, model_name, out_dir) {
 
-check_required_columns(
-  prop_data,
-  prop_required,
-  "prop_data"
-)
+  sink(file.path(out_dir, paste0(model_name, "_summary.txt")))
+  print(summary(model))
+  sink()
 
-
-#### 5. Clean and format data ------------------------------------
-
-richness_data <- richness_data %>%
-  mutate(
-    value = as.integer(value),
-
-    community_group = relevel(
-      factor(community_group),
-      ref = "native"
-    ),
-
-    barrier_type_reduced = relevel(
-      factor(barrier_type_reduced),
-      ref = "other"
-    ),
-
-    country     = factor(country),
-    HYBAS_ID    = factor(HYBAS_ID),
-    site_id     = factor(site_id),
-    method      = factor(method),
-    sample_year = factor(sample_year)
-  ) %>%
-  filter(
-    !is.na(value),
-    value >= 0
-  ) %>%
-  droplevels()
-
-
-prop_data <- prop_data %>%
-  mutate(
-    non_native = as.integer(non_native),
-    total_taxa = as.integer(total_taxa),
-
-    # Used only for data summaries and checks.
-    prop_non_native = non_native / total_taxa,
-
-    barrier_type_reduced = relevel(
-      factor(barrier_type_reduced),
-      ref = "other"
-    ),
-
-    country     = factor(country),
-    HYBAS_ID    = factor(HYBAS_ID),
-    site_id     = factor(site_id),
-    method      = factor(method),
-    sample_year = factor(sample_year)
-  ) %>%
-  filter(
-    !is.na(non_native),
-    !is.na(total_taxa),
-    total_taxa > 0,
-    non_native >= 0,
-    non_native <= total_taxa
-  ) %>%
-  droplevels()
-
-
-#### 6. Save input-data summaries --------------------------------
-
-data_summary <- capture.output({
-  cat("RICHNESS DATA\n")
-  cat("Rows and columns:\n")
-  print(dim(richness_data))
-
-  cat("\nCommunity groups:\n")
-  print(table(richness_data$community_group, useNA = "ifany"))
-
-  cat("\nBarrier types:\n")
-  print(table(richness_data$barrier_type_reduced, useNA = "ifany"))
-
-  cat("\nRichness response:\n")
-  print(summary(richness_data$value))
-
-  cat("\nRandom-effect levels:\n")
-  print(
-    sapply(
-      richness_data %>%
-        select(country, HYBAS_ID, site_id, method, sample_year),
-      nlevels
-    )
+  write.csv(
+    as.data.frame(fixef(model)),
+    file.path(out_dir, paste0(model_name, "_fixef.csv"))
   )
 
-  cat("\n\nPROPORTION NON-NATIVE DATA\n")
-  cat("Rows and columns:\n")
-  print(dim(prop_data))
+  sink(file.path(out_dir, paste0(model_name, "_diagnostics.txt")))
+  cat("Model:", model_name, "\n\n")
 
-  cat("\nBarrier types:\n")
-  print(table(prop_data$barrier_type_reduced, useNA = "ifany"))
+  cat("NUTS parameters:\n")
+  print(nuts_params(model) %>% count(Parameter, Value))
 
-  cat("\nObserved proportion non-native:\n")
-  print(summary(prop_data$prop_non_native))
+  cat("\nRhat summary:\n")
+  print(summary(rhat(model)))
 
-  cat("\nTotal taxa per sample:\n")
-  print(summary(prop_data$total_taxa))
+  cat("\nEffective sample size ratio summary:\n")
+  print(summary(neff_ratio(model)))
 
-  cat("\nRandom-effect levels:\n")
-  print(
-    sapply(
-      prop_data %>%
-        select(country, HYBAS_ID, site_id, method, sample_year),
-      nlevels
-    )
+  sink()
+
+  pdf(file.path(out_dir, paste0(model_name, "_ppcheck.pdf")), width = 8, height = 6)
+  print(pp_check(model, ndraws = 100))
+  dev.off()
+}
+
+#### 3. Select data path ########################################
+
+data_file <- switch(
+  model_name,
+  "A1i_Richnesswithtype"     = "A1i_Richnesswithtype_data.rds",
+  "A1ii_Richnesswithouttype" = "A1ii_Richnesswithouttype_data.rds",
+  "A2i_Shannonwithtype"      = "A2i_Shannonwithtype_data.rds",
+  "A2ii_Shannonwithouttype"  = "A2ii_Shannonwithouttype_data.rds",
+  "A3i_Propwithtype"         = "A3i_Propwithtype_data.rds",
+  "A3ii_Propwithouttype"     = "A3ii_Propwithouttype_data.rds"
+)
+
+data_path <- file.path(data_dir, data_file)
+check_file(data_path)
+
+dat <- readRDS(data_path)
+
+#### 4. Clean data ##############################################
+
+clean_common <- function(df) {
+  df %>%
+    mutate(
+      country = factor(country),
+      HYBAS_ID = factor(HYBAS_ID),
+      site_id = factor(site_id),
+      method = factor(method),
+      sample_year = factor(sample_year)
+    ) %>%
+    droplevels()
+}
+
+dat <- clean_common(dat)
+
+if (model_name %in% c("A1i_Richnesswithtype", "A1ii_Richnesswithouttype")) {
+  dat <- dat %>%
+    mutate(value = as.integer(value)) %>%
+    droplevels()
+}
+
+if (model_name %in% c("A2i_Shannonwithtype", "A2ii_Shannonwithouttype")) {
+  dat <- dat %>%
+    mutate(value = as.numeric(value)) %>%
+    filter(!is.na(value), value >= 0) %>%
+    droplevels()
+}
+
+if (model_name %in% c("A3i_Propwithtype", "A3ii_Propwithouttype")) {
+  dat <- dat %>%
+    mutate(
+      non_native = as.integer(non_native),
+      total_taxa = as.integer(total_taxa),
+      prop_non_native = as.numeric(prop_non_native)
+    ) %>%
+    filter(total_taxa > 0) %>%
+    droplevels()
+}
+
+if (grepl("withtype", model_name) && !grepl("withouttype", model_name)) {
+  dat <- dat %>%
+    mutate(
+      barrier_type_reduced = relevel(
+        factor(barrier_type_reduced),
+        ref = "other"
+      )
+    ) %>%
+    droplevels()
+}
+
+#### 5. Save data summary #######################################
+
+sink(file.path(out_dir, paste0(model_name, "_data_summary.txt")))
+
+cat("Model:", model_name, "\n")
+cat("Data file:", data_file, "\n\n")
+
+print(dim(dat))
+
+if ("value" %in% names(dat)) {
+  cat("\nResponse value summary:\n")
+  print(summary(dat$value))
+}
+
+if ("prop_non_native" %in% names(dat)) {
+  cat("\nProportion non-native summary:\n")
+  print(summary(dat$prop_non_native))
+  cat("\nNon-native count summary:\n")
+  print(summary(dat$non_native))
+  cat("\nTotal taxa summary:\n")
+  print(summary(dat$total_taxa))
+}
+
+if ("barrier_type_reduced" %in% names(dat)) {
+  cat("\nBarrier type counts:\n")
+  print(table(dat$barrier_type_reduced))
+}
+
+cat("\nRandom-effect levels:\n")
+print(
+  sapply(
+    dat %>% select(country, HYBAS_ID, site_id, method, sample_year),
+    nlevels
   )
-})
-
-writeLines(
-  data_summary,
-  file.path(out_dir, "model_data_summary.txt")
 )
 
+sink()
 
-#### 7. Priors ---------------------------------------------------
+#### 6. Formulae #################################################
 
-priors_richness <- c(
-  prior(normal(0, 0.5), class = "b"),
-  prior(normal(1, 1), class = "Intercept"),
-  prior(exponential(1), class = "sd"),
-  prior(exponential(1), class = "shape")
-)
-
-priors_prop <- c(
-  prior(normal(0, 0.5), class = "b"),
-  prior(normal(0, 1), class = "Intercept"),
-  prior(exponential(1), class = "sd")
-)
-
-
-#### 8. Model formulae -------------------------------------------
-
-# Richness is modelled separately for native and non-native
-# community groups. The three-way interaction tests whether the
-# relationship with barrier density differs among community groups
-# and barrier types.
-
-form_richness <- bf(
-  value ~
-    community_group * z_barrier_density * barrier_type_reduced +
+form_withtype <- bf(
+  value ~ z_barrier_density * barrier_type_reduced +
     z_dist_up +
     z_dist_down +
     z_dist_mouth +
@@ -274,11 +227,23 @@ form_richness <- bf(
     (1 | sample_year)
 )
 
+form_withouttype <- bf(
+  value ~ z_barrier_density +
+    z_dist_up +
+    z_dist_down +
+    z_dist_mouth +
+    z_log_population_density +
+    z_mean_temp_annual +
+    z_precip_annual +
+    z_log_river_km +
+    (1 | country) +
+    (1 | HYBAS_ID) +
+    (1 | site_id) +
+    (1 | method) +
+    (1 | sample_year)
+)
 
-# The response is the number of non-native taxa out of the total
-# number of taxa with known native status.
-
-form_prop <- bf(
+form_prop_withtype <- bf(
   non_native | trials(total_taxa) ~
     z_barrier_density * barrier_type_reduced +
     z_dist_up +
@@ -295,268 +260,171 @@ form_prop <- bf(
     (1 | sample_year)
 )
 
+form_prop_withouttype <- bf(
+  non_native | trials(total_taxa) ~
+    z_barrier_density +
+    z_dist_up +
+    z_dist_down +
+    z_dist_mouth +
+    z_log_population_density +
+    z_mean_temp_annual +
+    z_precip_annual +
+    z_log_river_km +
+    (1 | country) +
+    (1 | HYBAS_ID) +
+    (1 | site_id) +
+    (1 | method) +
+    (1 | sample_year)
+)
 
-#### 9. MCMC settings --------------------------------------------
+#### 7. Priors ###################################################
 
-# These are first-pass settings.
-# Increase adapt_delta or max_treedepth only if diagnostics require it.
+priors_count <- c(
+  prior(normal(0, 0.5), class = "b"),
+  prior(normal(1, 1), class = "Intercept"),
+  prior(exponential(1), class = "sd"),
+  prior(exponential(1), class = "shape")
+)
 
-chains_use        <- 4
-cores_use         <- 4
-iter_use          <- 4000
-warmup_use        <- 1000
-thin_use          <- 1
-adapt_delta_use   <- 0.95
+priors_shannon <- c(
+  prior(normal(0, 0.5), class = "b"),
+  prior(normal(1, 1), class = "Intercept"),
+  prior(exponential(1), class = "sd"),
+  prior(exponential(1), class = "sigma")
+)
+
+priors_prop <- c(
+  prior(normal(0, 0.5), class = "b"),
+  prior(normal(0, 1), class = "Intercept"),
+  prior(exponential(1), class = "sd")
+)
+
+#### 8. MCMC settings ############################################
+
+chains_use <- 4
+iter_use <- 4000
+warmup_use <- 1000
+thin_use <- 1
+adapt_delta_use <- 0.95
 max_treedepth_use <- 12
+refresh_use <- 100
 
+#### 9. Choose model settings ###################################
 
-#### 10. Fit richness model --------------------------------------
-
-m_invert_richness_final <- brm(
-  formula = form_richness,
-  data = richness_data,
-  family = negbinomial(),
-  prior = priors_richness,
-
-  chains = chains_use,
-  cores = cores_use,
-  iter = iter_use,
-  warmup = warmup_use,
-  thin = thin_use,
-
-  seed = 1201,
-  refresh = 100,
-
-  control = list(
-    adapt_delta = adapt_delta_use,
-    max_treedepth = max_treedepth_use
-  ),
-
-  save_pars = save_pars(all = TRUE),
-
-  file = file.path(
-    out_dir,
-    "m_invert_richness_final"
-  ),
-
-  file_refit = "on_change"
-)
-
-
-#### 11. Fit proportion non-native model -------------------------
-
-# beta_binomial2() allows greater variation than a standard
-# binomial model.
-
-m_invert_prop_final <- brm(
-  formula = form_prop,
-  data = prop_data,
-  family = beta_binomial2(),
-  prior = priors_prop,
-
-  chains = chains_use,
-  cores = cores_use,
-  iter = iter_use,
-  warmup = warmup_use,
-  thin = thin_use,
-
-  seed = 1202,
-  refresh = 100,
-
-  control = list(
-    adapt_delta = adapt_delta_use,
-    max_treedepth = max_treedepth_use
-  ),
-
-  save_pars = save_pars(all = TRUE),
-
-  file = file.path(
-    out_dir,
-    "m_invert_prop_final"
-  ),
-
-  file_refit = "on_change"
-)
-
-
-#### 12. Save model summaries ------------------------------------
-
-writeLines(
-  capture.output(summary(m_invert_richness_final)),
-  file.path(out_dir, "summary_invert_richness_final.txt")
-)
-
-writeLines(
-  capture.output(summary(m_invert_prop_final)),
-  file.path(out_dir, "summary_invert_prop_final.txt")
-)
-
-write.csv(
-  as.data.frame(fixef(m_invert_richness_final)),
-  file.path(out_dir, "fixef_invert_richness_final.csv"),
-  row.names = TRUE
-)
-
-write.csv(
-  as.data.frame(fixef(m_invert_prop_final)),
-  file.path(out_dir, "fixef_invert_prop_final.csv"),
-  row.names = TRUE
-)
-
-
-#### 13. Save diagnostic summaries -------------------------------
-
-summarise_model_diagnostics <- function(model, model_name) {
-  draws <- as_draws(model)
-
-  parameter_diagnostics <- summarise_draws(
-    draws,
-    rhat,
-    ess_bulk,
-    ess_tail
-  )
-
-  sampler_diagnostics <- nuts_params(model) %>%
-    count(Parameter, Value)
-
-  capture.output({
-    cat(model_name, "\n")
-    cat(strrep("=", nchar(model_name)), "\n\n")
-
-    cat("Sampler diagnostics:\n")
-    print(sampler_diagnostics)
-
-    cat("\nParameter diagnostics:\n")
-    print(parameter_diagnostics)
-
-    cat("\nMaximum R-hat:\n")
-    print(max(parameter_diagnostics$rhat, na.rm = TRUE))
-
-    cat("\nMinimum bulk ESS:\n")
-    print(min(parameter_diagnostics$ess_bulk, na.rm = TRUE))
-
-    cat("\nMinimum tail ESS:\n")
-    print(min(parameter_diagnostics$ess_tail, na.rm = TRUE))
-  })
+if (model_name == "A1i_Richnesswithtype") {
+  formula_use <- form_withtype
+  family_use <- negbinomial()
+  prior_use <- priors_count
+  seed_use <- 1101
 }
 
-diagnostic_text <- c(
-  summarise_model_diagnostics(
-    m_invert_richness_final,
-    "RICHNESS MODEL"
+if (model_name == "A1ii_Richnesswithouttype") {
+  formula_use <- form_withouttype
+  family_use <- negbinomial()
+  prior_use <- priors_count
+  seed_use <- 1102
+}
+
+if (model_name == "A2i_Shannonwithtype") {
+  formula_use <- form_withtype
+  family_use <- gaussian()
+  prior_use <- priors_shannon
+  seed_use <- 1201
+}
+
+if (model_name == "A2ii_Shannonwithouttype") {
+  formula_use <- form_withouttype
+  family_use <- gaussian()
+  prior_use <- priors_shannon
+  seed_use <- 1202
+}
+
+if (model_name == "A3i_Propwithtype") {
+  formula_use <- form_prop_withtype
+  family_use <- beta_binomial2()
+  prior_use <- priors_prop
+  seed_use <- 1301
+}
+
+if (model_name == "A3ii_Propwithouttype") {
+  formula_use <- form_prop_withouttype
+  family_use <- beta_binomial2()
+  prior_use <- priors_prop
+  seed_use <- 1302
+}
+
+#### 10. Fit model ##############################################
+
+fit <- brm(
+  formula = formula_use,
+  data = dat,
+  family = family_use,
+  prior = prior_use,
+  chains = chains_use,
+  iter = iter_use,
+  warmup = warmup_use,
+  thin = thin_use,
+  cores = 4,
+  seed = seed_use,
+  refresh = refresh_use,
+  control = list(
+    adapt_delta = adapt_delta_use,
+    max_treedepth = max_treedepth_use
   ),
-  "",
-  "",
-  summarise_model_diagnostics(
-    m_invert_prop_final,
-    "PROPORTION NON-NATIVE MODEL"
-  )
+  save_pars = save_pars(all = TRUE),
+  file = file.path(out_dir, model_name),
+  file_refit = "on_change"
 )
 
-writeLines(
-  diagnostic_text,
-  file.path(out_dir, "diagnostics_final_models.txt")
-)
+save_model_outputs(fit, model_name, out_dir)
 
+#### 11. Conditional effects ####################################
 
-#### 14. Posterior predictive checks -----------------------------
+if (grepl("withtype", model_name) && !grepl("withouttype", model_name)) {
 
-pdf(
-  file.path(out_dir, "ppcheck_invert_richness_final.pdf"),
-  width = 8,
-  height = 6
-)
-
-print(
-  pp_check(
-    m_invert_richness_final,
-    ndraws = 100
-  )
-)
-
-dev.off()
-
-
-pdf(
-  file.path(out_dir, "ppcheck_invert_prop_final.pdf"),
-  width = 8,
-  height = 6
-)
-
-print(
-  pp_check(
-    m_invert_prop_final,
-    ndraws = 100
-  )
-)
-
-dev.off()
-
-
-#### 15. Conditional-effects plots -------------------------------
-
-pdf(
-  file.path(
-    out_dir,
-    "conditional_effects_invert_richness_final.pdf"
-  ),
-  width = 10,
-  height = 7
-)
-
-plot(
-  conditional_effects(
-    m_invert_richness_final,
-    effects = paste(
-      "z_barrier_density",
-      "barrier_type_reduced",
-      "community_group",
-      sep = ":"
+  pdf(file.path(out_dir, paste0(model_name, "_conditional_effects.pdf")),
+      width = 10, height = 7)
+  print(
+    plot(
+      conditional_effects(
+        fit,
+        effects = "z_barrier_density:barrier_type_reduced"
+      ),
+      ask = FALSE
     )
-  ),
-  ask = FALSE
+  )
+  dev.off()
+
+} else {
+
+  pdf(file.path(out_dir, paste0(model_name, "_conditional_effects.pdf")),
+      width = 10, height = 7)
+  print(
+    plot(
+      conditional_effects(
+        fit,
+        effects = "z_barrier_density"
+      ),
+      ask = FALSE
+    )
+  )
+  dev.off()
+}
+
+#### 12. Save final object #######################################
+
+saveRDS(
+  fit,
+  file.path(out_dir, paste0(model_name, "_final_model_object.rds"))
 )
 
-dev.off()
-
-
-pdf(
-  file.path(
-    out_dir,
-    "conditional_effects_invert_prop_final.pdf"
-  ),
-  width = 10,
-  height = 7
-)
-
-plot(
-  conditional_effects(
-    m_invert_prop_final,
-    effects = "z_barrier_density:barrier_type_reduced"
-  ),
-  ask = FALSE
-)
-
-dev.off()
-
-
-#### 16. Record software versions --------------------------------
-
-writeLines(
-  capture.output(sessionInfo()),
-  file.path(out_dir, "session_info.txt")
-)
-
-
-#### 17. Archive outputs -----------------------------------------
-
-utils::tar(
-  tarfile = "final_invert_barrier_models_archive.tar.gz",
+tar(
+  tarfile = file.path(base_out_dir, paste0(model_name, "_archive.tar.gz")),
   files = out_dir,
   compression = "gzip"
 )
 
-cat(
-  "\nFinished final invertebrate richness and",
-  "proportion non-native models.\n"
-)
+cat("\n============================================================\n")
+cat("Finished model:", model_name, "\n")
+cat("Outputs saved to:", out_dir, "\n")
+cat("============================================================\n")

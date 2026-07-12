@@ -1,50 +1,60 @@
-# SharedEUConnectivity
+# Shared EU Connectivity Models
+This folder contains everything needed to run the six final invertebrate barrier models.
 
-Essential files
----------------
-1. Scripts/run_final_invert_barrier_models.R
-2. Scripts/run_final_invert_barrier_models.slurm
-3. Data/Processed/Final_Invert_Models/invert_richness_final_barrier_type_reduced.rds
-4. Data/Processed/Final_Invert_Models/invert_prop_final_barrier_type_reduced.rds
 
-Also useful
------------
-5. A short README explaining:
-   - the ecological question;
-   - what one row represents in each dataset;
-   - how richness, non_native, and total_taxa were calculated;
-   - how barrier density and distances were calculated;
-   - that all variables beginning z_ were transformed and standardised;
-   - the reference categories:
-       community_group = native
-       barrier_type_reduced = other
-   - whether unknown-status taxa were excluded from total_taxa;
-   - the R and brms versions used.
+### Model scripts
+The main model script is:
+Scripts/run_one_A1_A2_A3_model.R
 
-6. The script that created the two final RDS files, if the colleague
-   needs to audit the complete data-processing workflow.
+This script runs all six models.
 
-7. model_data_summary.txt and session_info.txt, after the model script
-   has run.
-
-Before submitting the SLURM job
--------------------------------
-The Logs directory must already exist because SLURM opens its output
-and error files before the job script begins:
-
-mkdir -p Logs completed_models/final_invert_barrier_models
-
-Then submit with:
-
-sbatch Scripts/run_final_invert_barrier_models.slurm
-
-Privacy and file size
----------------------
-Check whether site_id or other fields contain sensitive or restricted
-location information before sharing. The two prepared model datasets
-are sufficient for rerunning these models; raw occurrence records and
-spatial files are unnecessary unless the colleague is reviewing data
-preparation as well.
+The six SLURM scripts call this R script with the appropriate model name:
+run_A1i_Richnesswithtype.slurm
+run_A1ii_Richnesswithouttype.slurm
+run_A2i_Shannonwithtype.slurm
+run_A2ii_Shannonwithouttype.slurm
+run_A3i_Propwithtype.slurm
+run_A3ii_Propwithouttype.slurm
 
 
 
+### Model datasets
+These are ready to go:
+A1i_Richnesswithtype_data.rds
+A1ii_Richnesswithouttype_data.rds
+
+A2i_Shannonwithtype_data.rds
+A2ii_Shannonwithouttype_data.rds
+
+A3i_Propwithtype_data.rds
+A3ii_Propwithouttype_data.rds
+
+
+## Model overview
+The six models structures are:
+| Model | Response | Barrier type |
+|-------|----------|--------------|
+| A1i | Total richness | Included |
+| A1ii | Total richness | Not included |
+| A2i | Shannon diversity | Included |
+| A2ii | Shannon diversity | Not included |
+| A3i | Proportion of non-native taxa | Included |
+| A3ii | Proportion of non-native taxa | Not included |
+
+The "with type" models include an interaction with reduced barrier type (other, dam, weir and culvert).
+
+The "without type" models use total barrier density only.
+
+## Data preparation
+
+Here we...
+- calculate richness, Shannon diversity and proportion of non-native taxa
+- calculate barrier density
+- calculate upstream, downstream and distance-to-mouth variables
+- join climate and population density data
+- standardise all continuous predictors (variables beginning with `z_`)
+- create the final model-ready datasets
+
+I haven't sent the raw data through for the prep code but I can if you would like it.
+
+If anything is unclear just let me know!

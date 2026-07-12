@@ -1,0 +1,1344 @@
+
+
+
+### Final prep code ######
+### A) AMBER analysis - keeping it simple ############
+# This we are just doing density of barriers X type (and we will run one without the type interaction) 
+# we can come back later and do direction maybe
+# control for year, community, basin
+
+#### ============================================================
+#### SCRIPT 01: PREPARE INVERTEBRATE DATA FOR FINAL BARRIER MODELS
+#### Models prepared:
+####   A) richness
+####   B) proportion non-native
+####
+#### Final structure:
+#### richness ~ community_group * z_barrier_density * barrier_type_reduced +
+####   z_dist_up + z_dist_down + z_dist_mouth +
+####   z_log_population_density + z_mean_temp_annual + z_precip_annual +
+####   z_log_river_km +
+####   (1|country) + (1|HYBAS_ID) + (1|site_id) +
+####   (1|method) + (1|sample_year)
+#### ============================================================
+
+#### 0. Setup ####################################################
+
+setwd("C:/Users/User/OneDrive - Queen's University Belfast/PhD/Chapters/Chapter 3 European Connectivity (Inverts)/UpToDateWork/EUConnectivity_Inverts")
+
+library(sf)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(vegan)
+library(igraph)
+library(readr)
+
+sf_use_s2(FALSE)
+options(scipen = 999)
+
+dir.create("Data/Processed/Final_Invert_Models", recursive = TRUE, showWarnings = FALSE)
+
+z_safe <- function(x) {
+  x <- as.numeric(x)
+  if (sum(!is.na(x)) < 2 || length(unique(na.omit(x))) <= 1) {
+    return(rep(0, length(x)))
+  }
+  as.numeric(scale(x))
+}
+
+clean_barrier_type <- function(x) {
+  x <- str_trim(tolower(as.character(x)))
+  case_when(
+    str_detect(x, "dam")     ~ "dam",
+    str_detect(x, "weir")    ~ "weir",
+    str_detect(x, "culvert") ~ "culvert",
+    TRUE                     ~ "other"
+  )
+}
+
+parse_num <- function(x) {
+  x <- str_trim(as.character(x))
+  x <- na_if(x, "")
+  x <- gsub(",", ".", x)
+  suppressWarnings(as.numeric(x))
+}
+
+#### 1. Load raw data ############################################
+
+inverts_df <- read_xlsx("Data/Inverts data/Global_dataset.xlsx")
+amber_sf   <- read_sf("Data/AMBER data/AMBER map.shp")
+basins_sf  <- read_sf("Data/HydroBasins EU/hybas_eu_lev07_v1c.shp") %>%
+  st_make_valid() %>%
+  mutate(HYBAS_ID = as.character(HYBAS_ID))
+
+rivers_sf  <- read_sf("Data/HydroRivers EU/HydroRIVERS_v10_eu.shp") %>%
+  mutate(
+    HYRIV_ID  = as.character(HYRIV_ID),
+    NEXT_DOWN = as.character(NEXT_DOWN),
+    MAIN_RIV  = as.character(MAIN_RIV))
+
+#### 2. Clean invertebrate records ###############################
+inverts_clean <- inverts_df %>%
+  transmute(
+    site_id = as.character(site_id),
+    sample_year = suppressWarnings(as.integer(year)),
+    taxon = as.character(taxon),
+    abundance_num = suppressWarnings(as.numeric(abundance)),
+    country = as.character(country),
+    method = as.character(Method),
+    Longitude_X = parse_num(Longitude_X),
+    Latitude_Y  = parse_num(Latitude_Y),
+    alien_status = case_when(
+      str_trim(tolower(as.character(Alien))) %in%
+        c("yes", "y", "alien", "non-native", "nonnative",
+          "non native", "introduced", "invasive") ~ "non_native",
+      str_trim(tolower(as.character(Alien))) %in%
+        c("no", "n", "native") ~ "native",
+      TRUE ~ "unknown")) %>%
+  filter(
+    !is.na(site_id),
+    !is.na(sample_year),
+    !is.na(taxon),
+    !is.na(Longitude_X),
+    !is.na(Latitude_Y))
+
+inverts_sf <- inverts_clean %>%
+  st_as_sf(coords = c("Longitude_X", "Latitude_Y"), crs = 4326, remove = FALSE)
+
+#### 3. Clean AMBER barriers #####################################
+amber_clean_sf <- amber_sf %>%
+  mutate(
+    AMBER_ID = row_number(),
+    barrier_type_reduced = clean_barrier_type(type))
+
+#### 4. Keep only features inside HydroBASINS L7 #################
+inverts_basins_sf <- st_join(
+  inverts_sf,
+  basins_sf %>% select(HYBAS_ID),
+  join = st_intersects) %>%
+  filter(!is.na(HYBAS_ID))
+
+amber_basins_sf <- st_join(
+  amber_clean_sf,
+  basins_sf %>% select(HYBAS_ID),
+  join = st_intersects) %>%
+  filter(!is.na(HYBAS_ID))
+
+#### 5. Snap points to nearest HydroRIVERS segment within 2000 m ##
+snap_to_river <- function(points_sf, rivers_sf, threshold_m = 2000) {
+  pts_3035 <- st_transform(points_sf, 3035)
+  riv_3035 <- st_transform(rivers_sf, 3035)
+  
+  nearest_idx <- st_nearest_feature(pts_3035, riv_3035)
+  dist_m <- as.numeric(
+    st_distance(pts_3035, riv_3035[nearest_idx, ], by_element = TRUE))
+  
+  keep <- dist_m <= threshold_m
+  
+  out <- bind_cols(
+    st_drop_geometry(pts_3035[keep, ]),
+    st_drop_geometry(riv_3035[nearest_idx[keep], ]) %>%
+      select(HYRIV_ID, NEXT_DOWN, MAIN_RIV, LENGTH_KM, DIST_DN_KM))
+  
+  out$dist_to_river_m <- dist_m[keep]
+  out
+}
+
+SNAP_THRESHOLD_M <- 2000
+
+inverts_rivers_df <- snap_to_river(inverts_basins_sf, rivers_sf, SNAP_THRESHOLD_M) %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    HYRIV_ID = as.character(HYRIV_ID),
+    site_sample_id = paste(site_id, sample_year, sep = "_"))
+
+amber_rivers_df <- snap_to_river(amber_basins_sf, rivers_sf, SNAP_THRESHOLD_M) %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    HYRIV_ID = as.character(HYRIV_ID),
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert")))
+
+#### 6. QC: check each community assigned one HydroRIVERS segment ######
+#### A community here means one site_id × sample_year.
+segment_check_site_year <- inverts_rivers_df %>%
+  distinct(site_id, sample_year, HYRIV_ID) %>%
+  count(site_id, sample_year, name = "n_segments_assigned") %>%
+  arrange(desc(n_segments_assigned))
+
+problem_site_years <- segment_check_site_year %>%
+  filter(n_segments_assigned > 1)
+
+write_csv(segment_check_site_year, "Data/Processed/Final_Invert_Models/QC_site_year_segment_assignment.csv")
+
+write_csv(problem_site_years, "Data/Processed/Final_Invert_Models/QC_problem_site_years_more_than_one_segment.csv")
+
+cat("\nHydroRIVERS segment assignment check\n")
+cat("Total site-years checked:", nrow(segment_check_site_year), "\n")
+cat("Site-years assigned >1 HydroRIVERS segment:", nrow(problem_site_years), "\n")
+# Site-years assigned >1 HydroRIVERS segment: 0 
+
+if (nrow(problem_site_years) > 0) {
+  
+  problem_details <- inverts_rivers_df %>%
+    semi_join(problem_site_years, by = c("site_id", "sample_year")) %>%
+    distinct(
+      site_id,
+      sample_year,
+      HYRIV_ID,
+      HYBAS_ID,
+      MAIN_RIV,
+      dist_to_river_m) %>%
+    arrange(site_id, sample_year, dist_to_river_m)
+  
+  write_csv(problem_details, "Data/Processed/Final_Invert_Models/QC_problem_site_year_segment_details.csv")
+  
+  stop("Some site_id × sample_year communities were assigned to more than one HydroRIVERS segment. ",
+    "Check QC_problem_site_year_segment_details.csv before modelling.")
+}
+
+
+
+#### 7. River length per HydroBASINS L7 basin ####################
+basins_3035 <- st_transform(basins_sf, 3035) %>% st_make_valid()
+rivers_3035 <- st_transform(rivers_sf, 3035)
+
+rivers_cut_sf <- st_intersection(st_make_valid(rivers_3035), basins_3035 %>%
+    select(HYBAS_ID))
+
+river_len_df <- rivers_cut_sf %>%
+  mutate(river_km = as.numeric(st_length(geometry)) / 1000) %>%
+  st_drop_geometry() %>%
+  group_by(HYBAS_ID) %>%
+  summarise(river_km = sum(river_km, na.rm = TRUE), .groups = "drop") %>%
+  mutate(HYBAS_ID = as.character(HYBAS_ID),
+    log_river_km = log1p(river_km))
+
+#### 8. HydroRIVERS network distances: up/down/mouth #############
+river_topo <- rivers_sf %>%
+  st_drop_geometry() %>%
+  transmute(
+    HYRIV_ID = as.character(HYRIV_ID),
+    NEXT_DOWN = as.character(NEXT_DOWN),
+    MAIN_RIV = as.character(MAIN_RIV),
+    LENGTH_KM = as.numeric(LENGTH_KM),
+    DIST_DN_KM = as.numeric(DIST_DN_KM)) %>%
+  filter(!is.na(HYRIV_ID)) %>%
+  distinct(HYRIV_ID, .keep_all = TRUE)
+
+edges <- river_topo %>%
+  filter(!is.na(NEXT_DOWN), NEXT_DOWN != "0", NEXT_DOWN %in% river_topo$HYRIV_ID) %>%
+  transmute(
+    from = HYRIV_ID,
+    to = NEXT_DOWN,
+    weight = pmax(LENGTH_KM, 0.001))
+
+g_river <- graph_from_data_frame(edges,directed = TRUE, vertices = river_topo %>% 
+    select(name = HYRIV_ID, MAIN_RIV, LENGTH_KM, DIST_DN_KM))
+
+get_downstream_path_km <- function(x) {
+  if (!x %in% V(g_river)$name) return(NA_real_)
+  nodes <- setdiff(names(subcomponent(g_river, x, mode = "out")), x)
+  if (length(nodes) == 0) return(0)
+  sum(river_topo$LENGTH_KM[match(nodes, river_topo$HYRIV_ID)], na.rm = TRUE)
+}
+
+get_upstream_network_km <- function(x) {
+  if (!x %in% V(g_river)$name) return(NA_real_)
+  nodes <- setdiff(names(subcomponent(g_river, x, mode = "in")), x)
+  if (length(nodes) == 0) return(0)
+  sum(river_topo$LENGTH_KM[match(nodes, river_topo$HYRIV_ID)], na.rm = TRUE)
+}
+
+site_river_position <- inverts_rivers_df %>%
+  distinct(site_id, sample_year, HYRIV_ID) %>%
+  mutate(
+    dist_up_km = map_dbl(HYRIV_ID, get_upstream_network_km),
+    dist_down_km = map_dbl(HYRIV_ID, get_downstream_path_km)) %>%
+  left_join(
+    river_topo %>% select(HYRIV_ID, dist_mouth_km = DIST_DN_KM),
+    by = "HYRIV_ID") %>%
+  mutate(
+    log_dist_up = log1p(dist_up_km),
+    log_dist_down = log1p(dist_down_km),
+    log_dist_mouth = log1p(dist_mouth_km))
+
+#### 9. Basin barrier density by reduced type ####################
+barrier_density_df <- amber_rivers_df %>%
+  filter(!is.na(HYBAS_ID), !is.na(barrier_type_reduced)) %>%
+  count(HYBAS_ID, barrier_type_reduced, name = "n_barrier") %>%
+  right_join(
+    expand_grid(
+      HYBAS_ID = unique(river_len_df$HYBAS_ID),
+      barrier_type_reduced = c("other", "dam", "weir", "culvert")),
+    by = c("HYBAS_ID", "barrier_type_reduced")) %>%
+  left_join(river_len_df, by = "HYBAS_ID") %>%
+  mutate(
+    n_barrier = coalesce(n_barrier, 0L),
+    barrier_density = if_else(river_km > 0, n_barrier / river_km, NA_real_),
+    log_barrier_density = log1p(barrier_density),
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert")))
+
+#### 10. Community response data ################################
+#### Final response variables:
+####   1. total_richness
+####   2. shannon
+####   3. proportion of non-native taxa
+####
+#### Important decisions:
+####   - total_richness = number of distinct taxa per site × year
+####   - shannon = Shannon diversity using taxon abundances
+####   - proportion non-native = non-native taxa / total known-status taxa
+####   - unknown-status taxa are excluded from the denominator for proportion
+####   - abundance is used for Shannon, but not for proportion non-native
+
+#### 10a. Collapse to one row per taxon per community ############
+#### Community = site_id × sample_year.
+#### This prevents duplicate taxon rows from inflating richness.
+community_taxon_df <- inverts_rivers_df %>%
+  filter(
+    !is.na(site_id),
+    !is.na(sample_year),
+    !is.na(HYBAS_ID),
+    !is.na(taxon)) %>%
+  mutate(
+    abundance_num = suppressWarnings(as.numeric(abundance_num)),
+    abundance_num = if_else(is.na(abundance_num), 0, abundance_num),
+    alien_status = case_when(
+      alien_status %in% c("native", "non_native") ~ alien_status,
+      TRUE ~ "unknown")) %>%
+  group_by(
+    site_id,
+    sample_year,
+    HYBAS_ID,
+    country,
+    method,
+    taxon) %>%
+  summarise(
+    abundance_taxon = sum(abundance_num, na.rm = TRUE),
+    alien_status = first(na.omit(alien_status)),
+    .groups = "drop") %>%
+  mutate(
+    alien_status = if_else(
+      is.na(alien_status),
+      "unknown",
+      alien_status))
+
+
+#### 10b. QC: check conflicting alien statuses ###################
+#### This checks whether the same taxon in the same site-year has
+#### been labelled as both native and non-native/unknown somewhere.
+alien_status_conflicts <- inverts_rivers_df %>%
+  filter(
+    !is.na(site_id),
+    !is.na(sample_year),
+    !is.na(taxon)) %>%
+  mutate(
+    alien_status = case_when(
+      alien_status %in% c("native", "non_native") ~ alien_status,
+      TRUE ~ "unknown")) %>%
+  distinct(site_id, sample_year, taxon, alien_status) %>%
+  count(site_id, sample_year, taxon, name = "n_statuses") %>%
+  filter(n_statuses > 1)
+
+write_csv(alien_status_conflicts, "Data/Processed/Final_Invert_Models/QC_alien_status_conflicts.csv")
+
+cat("\nTaxa with conflicting alien statuses within site-year:",
+    nrow(alien_status_conflicts), "\n")
+
+
+#### 10c. Total richness and Shannon diversity ###################
+#### This is one row per site × year.
+#### total_richness includes all taxa, including unknown alien status.
+#### Shannon uses abundance summed per taxon.
+site_diversity_base <- community_taxon_df %>%
+  group_by(
+    site_id,
+    sample_year,
+    HYBAS_ID,
+    country,
+    method) %>%
+  summarise(
+    total_richness = n_distinct(taxon),
+    
+    shannon = vegan::diversity(
+      abundance_taxon,
+      index = "shannon"),
+    
+    total_abundance = sum(abundance_taxon, na.rm = TRUE),
+    
+    n_native_taxa = n_distinct(taxon[alien_status == "native"]),
+    n_non_native_taxa = n_distinct(taxon[alien_status == "non_native"]),
+    n_unknown_taxa = n_distinct(taxon[alien_status == "unknown"]),
+    
+    .groups = "drop") %>%
+  mutate(
+    total_known_taxa = n_native_taxa + n_non_native_taxa,
+    
+    prop_unknown_taxa = if_else(
+      total_richness > 0,
+      n_unknown_taxa / total_richness,
+      NA_real_))
+
+
+#### 10d. Proportion of non-native taxa ##########################
+#### This is the main non-native response.
+#### It is based on number of taxa/species, not abundance.
+site_prop_base <- site_diversity_base %>%
+  transmute(
+    site_id,
+    sample_year,
+    HYBAS_ID,
+    country,
+    method,
+    
+    native_taxa = n_native_taxa,
+    non_native_taxa = n_non_native_taxa,
+    unknown_taxa = n_unknown_taxa,
+    total_known_taxa,
+    total_richness,
+    
+    prop_non_native_taxa = if_else(
+      total_known_taxa > 0,
+      non_native_taxa / total_known_taxa,
+      NA_real_),
+    
+    prop_unknown_taxa) %>%
+  filter(total_known_taxa > 0)
+
+
+#### 10e. Optional abundance-based non-native proportion #########
+#### This is NOT the main response.
+#### It is useful later as a sensitivity check if needed.
+site_abundance_prop_base <- community_taxon_df %>%
+  group_by(
+    site_id,
+    sample_year,
+    HYBAS_ID,
+    country,
+    method) %>%
+  summarise(
+    native_abundance = sum(
+      abundance_taxon[alien_status == "native"],
+      na.rm = TRUE),
+    
+    non_native_abundance = sum(
+      abundance_taxon[alien_status == "non_native"],
+      na.rm = TRUE),
+    
+    unknown_abundance = sum(
+      abundance_taxon[alien_status == "unknown"],
+      na.rm = TRUE),
+    
+    .groups = "drop") %>%
+  mutate(
+    total_known_abundance = native_abundance + non_native_abundance,
+    
+    prop_non_native_abundance = if_else(
+      total_known_abundance > 0,
+      non_native_abundance / total_known_abundance,
+      NA_real_))
+
+
+#### 10f. Long-format data for richness and Shannon models #######
+#### This lets you fit richness and Shannon with the same joining code later.
+#### response = "total_richness" or "shannon"
+#### value = response value
+site_response_long <- site_diversity_base %>%
+  select(
+    site_id,
+    sample_year,
+    HYBAS_ID,
+    country,
+    method,
+    total_richness,
+    shannon,
+    total_abundance,
+    n_native_taxa,
+    n_non_native_taxa,
+    n_unknown_taxa,
+    total_known_taxa,
+    prop_unknown_taxa) %>%
+  pivot_longer(
+    cols = c(total_richness, shannon),
+    names_to = "response",
+    values_to = "value") %>%
+  mutate(
+    response = factor(
+      response,
+      levels = c("total_richness", "shannon")))
+
+
+#### 10g. Quick checks ###########################################
+cat("\n--- Community response checks ---\n")
+
+cat("\nNumber of site-year communities in diversity data:\n")
+print(nrow(site_diversity_base))
+
+cat("\nSummary of total richness:\n")
+print(summary(site_diversity_base$total_richness))
+
+cat("\nSummary of Shannon diversity:\n")
+print(summary(site_diversity_base$shannon))
+
+cat("\nSummary of proportion non-native taxa:\n")
+print(summary(site_prop_base$prop_non_native_taxa))
+
+cat("\nUnknown-status taxa summary:\n")
+print(summary(site_diversity_base$prop_unknown_taxa))
+
+cat("\nCommunities with no known native/non-native taxa excluded from proportion model:\n")
+print(
+  site_diversity_base %>%
+    summarise(
+      n_total_communities = n(),
+      n_no_known_status = sum(total_known_taxa == 0, na.rm = TRUE),
+      prop_no_known_status = n_no_known_status / n_total_communities))
+
+
+#### 10h. Save response objects for inspection ###################
+saveRDS(community_taxon_df, "Data/Processed/Final_Invert_Models/community_taxon_df.rds")
+saveRDS(site_diversity_base, "Data/Processed/Final_Invert_Models/site_diversity_base.rds")
+saveRDS(site_response_long, "Data/Processed/Final_Invert_Models/site_response_long_total_richness_shannon.rds")
+saveRDS(site_prop_base, "Data/Processed/Final_Invert_Models/site_prop_base_non_native_taxa.rds")
+saveRDS(site_abundance_prop_base, "Data/Processed/Final_Invert_Models/site_abundance_prop_base_sensitivity.rds")
+
+write_csv(site_diversity_base, "Data/Processed/Final_Invert_Models/site_diversity_base.csv")
+write_csv(site_response_long, "Data/Processed/Final_Invert_Models/site_response_long_total_richness_shannon.csv")
+write_csv(site_prop_base, "Data/Processed/Final_Invert_Models/site_prop_base_non_native_taxa.csv")
+write_csv(site_abundance_prop_base, "Data/Processed/Final_Invert_Models/site_abundance_prop_base_sensitivity.csv")
+
+#### 11. Climate data ############################################
+basin_year_climate_long <- readRDS("Data/Processed/basin_year_climate_long.rds")
+
+climate_wide <- basin_year_climate_long %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    sample_year = as.integer(sample_year)) %>%
+  group_by(HYBAS_ID, sample_year, climate_variable) %>%
+  summarise(climate_value = mean(climate_value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = climate_variable, values_from = climate_value)
+
+#### 12. HYDE population density #################################
+read_hyde_var <- function(var) {
+  files <- list.files(
+    "Data/HYDE/Processed",
+    pattern = paste0("^", var, "_[0-9]{4}_[0-9]{4}\\.csv$"),
+    full.names = TRUE)
+  
+  if (length(files) == 0) {
+    stop("No HYDE processed files found for: ", var)
+  }
+  
+  map_dfr(sort(files), read_csv, show_col_types = FALSE) %>%
+    mutate(
+      HYBAS_ID = as.character(HYBAS_ID),
+      year = as.integer(year)) %>%
+    distinct()
+}
+
+hyde_pop_density <- read_hyde_var("population_density")
+
+hyde_full <- hyde_pop_density %>%
+  rename(mean_population_density = population_density) %>%
+  mutate(
+    log_population_density = log1p(mean_population_density))
+
+hyde_1961 <- hyde_full %>%
+  filter(year == 1961) %>%
+  select(HYBAS_ID, log_population_density_1961 = log_population_density)
+
+
+#### 13a. Model data for total richness and Shannon diversity ####
+#### Uses site_response_long from Section 10.
+#### One row per site × year × response × barrier type.
+#### response = total_richness or shannon.
+invert_diversity_model_data <- site_response_long %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    site_id = as.character(site_id),
+    sample_year = as.integer(as.character(sample_year))) %>%
+  left_join(
+    site_river_position %>%
+      mutate(
+        site_id = as.character(site_id),
+        sample_year = as.integer(as.character(sample_year))),
+    by = c("site_id", "sample_year")) %>%
+  left_join(
+    climate_wide %>%
+      mutate(
+        HYBAS_ID = as.character(HYBAS_ID),
+        sample_year = as.integer(as.character(sample_year))),
+    by = c("HYBAS_ID", "sample_year")) %>%
+  left_join(
+    river_len_df %>%
+      mutate(HYBAS_ID = as.character(HYBAS_ID)),
+    by = "HYBAS_ID") %>%
+  left_join(
+    hyde_full %>%
+      mutate(
+        HYBAS_ID = as.character(HYBAS_ID),
+        year = as.integer(year)) %>%
+      select(HYBAS_ID, sample_year = year, log_population_density),
+    by = c("HYBAS_ID", "sample_year")) %>%
+  left_join(
+    hyde_1961 %>%
+      mutate(HYBAS_ID = as.character(HYBAS_ID)),
+    by = "HYBAS_ID") %>%
+  mutate(
+    log_population_density = if_else(
+      is.na(log_population_density) & sample_year < 1961,
+      log_population_density_1961,
+      log_population_density)) %>%
+  select(-log_population_density_1961) %>%
+  tidyr::crossing(
+    barrier_type_reduced = factor(
+      c("other", "dam", "weir", "culvert"),
+      levels = c("other", "dam", "weir", "culvert"))) %>%
+  left_join(
+    barrier_density_df %>%
+      mutate(
+        HYBAS_ID = as.character(HYBAS_ID),
+        barrier_type_reduced = factor(
+          barrier_type_reduced,
+          levels = c("other", "dam", "weir", "culvert"))) %>%
+      select(
+        HYBAS_ID,
+        barrier_type_reduced,
+        n_barrier,
+        barrier_density,
+        log_barrier_density),
+    by = c("HYBAS_ID", "barrier_type_reduced")) %>%
+  mutate(
+    z_barrier_density = z_safe(log_barrier_density),
+    z_dist_up = z_safe(log_dist_up),
+    z_dist_down = z_safe(log_dist_down),
+    z_dist_mouth = z_safe(log_dist_mouth),
+    z_log_population_density = z_safe(log_population_density),
+    z_mean_temp_annual = z_safe(mean_temp_annual),
+    z_precip_annual = z_safe(precip_annual),
+    z_log_river_km = z_safe(log_river_km),
+    
+    response = factor(
+      response,
+      levels = c("total_richness", "shannon")),
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert")),
+    country = factor(country),
+    HYBAS_ID = factor(HYBAS_ID),
+    site_id = factor(site_id),
+    method = factor(method),
+    sample_year = factor(sample_year)) %>%
+  select(
+    value,
+    response,
+    barrier_type_reduced,
+    z_barrier_density,
+    z_dist_up,
+    z_dist_down,
+    z_dist_mouth,
+    z_log_population_density,
+    z_mean_temp_annual,
+    z_precip_annual,
+    z_log_river_km,
+    country,
+    HYBAS_ID,
+    site_id,
+    method,
+    sample_year,
+    everything()) %>%
+  filter(
+    complete.cases(
+      value,
+      response,
+      barrier_type_reduced,
+      z_barrier_density,
+      z_dist_up,
+      z_dist_down,
+      z_dist_mouth,
+      z_log_population_density,
+      z_mean_temp_annual,
+      z_precip_annual,
+      z_log_river_km,
+      country,
+      HYBAS_ID,
+      site_id,
+      method,
+      sample_year)) %>%
+  droplevels()
+
+invert_total_richness_model_data <- invert_diversity_model_data %>%
+  filter(response == "total_richness") %>%
+  mutate(
+    value = as.integer(value)) %>%
+  droplevels()
+
+invert_shannon_model_data <- invert_diversity_model_data %>%
+  filter(response == "shannon") %>%
+  mutate(
+    value = as.numeric(value)) %>%
+  filter(value >= 0) %>%
+  droplevels()
+
+#### 13b. Model data for proportion non-native taxa ##############
+#### Uses site_prop_base from Section 10.
+#### One row per site × year × barrier type.
+invert_prop_model_data <- site_prop_base %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    site_id = as.character(site_id),
+    sample_year = as.integer(as.character(sample_year))) %>%
+  left_join(
+    site_river_position %>%
+      mutate(
+        site_id = as.character(site_id),
+        sample_year = as.integer(as.character(sample_year))),
+    by = c("site_id", "sample_year")) %>%
+  left_join(
+    climate_wide %>%
+      mutate(
+        HYBAS_ID = as.character(HYBAS_ID),
+        sample_year = as.integer(as.character(sample_year))),
+    by = c("HYBAS_ID", "sample_year")) %>%
+  left_join(
+    river_len_df %>%
+      mutate(HYBAS_ID = as.character(HYBAS_ID)),
+    by = "HYBAS_ID") %>%
+  left_join(
+    hyde_full %>%
+      mutate(
+        HYBAS_ID = as.character(HYBAS_ID),
+        year = as.integer(year)) %>%
+      select(HYBAS_ID, sample_year = year, log_population_density),
+    by = c("HYBAS_ID", "sample_year")) %>%
+  left_join(
+    hyde_1961 %>%
+      mutate(HYBAS_ID = as.character(HYBAS_ID)),
+    by = "HYBAS_ID") %>%
+  mutate(
+    log_population_density = if_else(
+      is.na(log_population_density) & sample_year < 1961,
+      log_population_density_1961,
+      log_population_density)) %>%
+  select(-log_population_density_1961) %>%
+  tidyr::crossing(
+    barrier_type_reduced = factor(
+      c("other", "dam", "weir", "culvert"),
+      levels = c("other", "dam", "weir", "culvert"))) %>%
+  left_join(
+    barrier_density_df %>%
+      mutate(
+        HYBAS_ID = as.character(HYBAS_ID),
+        barrier_type_reduced = factor(
+          barrier_type_reduced,
+          levels = c("other", "dam", "weir", "culvert"))) %>%
+      select(
+        HYBAS_ID,
+        barrier_type_reduced,
+        n_barrier,
+        barrier_density,
+        log_barrier_density),
+    by = c("HYBAS_ID", "barrier_type_reduced")) %>%
+  mutate(
+    non_native = as.integer(non_native_taxa),
+    total_taxa = as.integer(total_known_taxa),
+    prop_non_native = prop_non_native_taxa,
+    
+    z_barrier_density = z_safe(log_barrier_density),
+    z_dist_up = z_safe(log_dist_up),
+    z_dist_down = z_safe(log_dist_down),
+    z_dist_mouth = z_safe(log_dist_mouth),
+    z_log_population_density = z_safe(log_population_density),
+    z_mean_temp_annual = z_safe(mean_temp_annual),
+    z_precip_annual = z_safe(precip_annual),
+    z_log_river_km = z_safe(log_river_km),
+    
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert")),
+    country = factor(country),
+    HYBAS_ID = factor(HYBAS_ID),
+    site_id = factor(site_id),
+    method = factor(method),
+    sample_year = factor(sample_year)) %>%
+  filter(total_taxa > 0) %>%
+  select(
+    non_native,
+    total_taxa,
+    prop_non_native,
+    barrier_type_reduced,
+    z_barrier_density,
+    z_dist_up,
+    z_dist_down,
+    z_dist_mouth,
+    z_log_population_density,
+    z_mean_temp_annual,
+    z_precip_annual,
+    z_log_river_km,
+    country,
+    HYBAS_ID,
+    site_id,
+    method,
+    sample_year,
+    everything()) %>%
+  filter(
+    complete.cases(
+      non_native,
+      total_taxa,
+      prop_non_native,
+      barrier_type_reduced,
+      z_barrier_density,
+      z_dist_up,
+      z_dist_down,
+      z_dist_mouth,
+      z_log_population_density,
+      z_mean_temp_annual,
+      z_precip_annual,
+      z_log_river_km,
+      country,
+      HYBAS_ID,
+      site_id,
+      method,
+      sample_year)) %>%
+  droplevels()
+
+
+#### 14. Final checks ############################################
+cat("\n============================================================\n")
+cat("FINAL MODEL DATA CHECKS\n")
+cat("============================================================\n")
+
+cat("\nTotal richness rows:", nrow(invert_total_richness_model_data), "\n")
+cat("Shannon rows:", nrow(invert_shannon_model_data), "\n")
+cat("Proportion non-native rows:", nrow(invert_prop_model_data), "\n")
+
+cat("\nBarrier types in total richness data:\n")
+print(table(invert_total_richness_model_data$barrier_type_reduced))
+
+cat("\nBarrier types in Shannon data:\n")
+print(table(invert_shannon_model_data$barrier_type_reduced))
+
+cat("\nBarrier types in proportion non-native data:\n")
+print(table(invert_prop_model_data$barrier_type_reduced))
+
+cat("\nSummary of total richness response:\n")
+print(summary(invert_total_richness_model_data$value))
+
+cat("\nSummary of Shannon response:\n")
+print(summary(invert_shannon_model_data$value))
+
+cat("\nSummary of proportion non-native response:\n")
+print(summary(invert_prop_model_data$prop_non_native))
+
+cat("\nSummary of non-native taxa counts:\n")
+print(summary(invert_prop_model_data$non_native))
+
+cat("\nSummary of total known taxa counts:\n")
+print(summary(invert_prop_model_data$total_taxa))
+
+
+#### 14a. Write model-data summaries #############################
+write_csv(
+  invert_total_richness_model_data %>%
+    summarise(
+      response = "total_richness",
+      n_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_basins = n_distinct(HYBAS_ID),
+      n_countries = n_distinct(country),
+      n_methods = n_distinct(method),
+      n_years = n_distinct(sample_year),
+      min_value = min(value, na.rm = TRUE),
+      median_value = median(value, na.rm = TRUE),
+      mean_value = mean(value, na.rm = TRUE),
+      max_value = max(value, na.rm = TRUE)),
+  "Data/Processed/Final_Invert_Models/QC_total_richness_summary.csv")
+
+write_csv(
+  invert_shannon_model_data %>%
+    summarise(
+      response = "shannon",
+      n_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_basins = n_distinct(HYBAS_ID),
+      n_countries = n_distinct(country),
+      n_methods = n_distinct(method),
+      n_years = n_distinct(sample_year),
+      min_value = min(value, na.rm = TRUE),
+      median_value = median(value, na.rm = TRUE),
+      mean_value = mean(value, na.rm = TRUE),
+      max_value = max(value, na.rm = TRUE)),
+  "Data/Processed/Final_Invert_Models/QC_shannon_summary.csv")
+
+write_csv(
+  invert_prop_model_data %>%
+    summarise(
+      response = "prop_non_native_taxa",
+      n_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_basins = n_distinct(HYBAS_ID),
+      n_countries = n_distinct(country),
+      n_methods = n_distinct(method),
+      n_years = n_distinct(sample_year),
+      min_prop_non_native = min(prop_non_native, na.rm = TRUE),
+      median_prop_non_native = median(prop_non_native, na.rm = TRUE),
+      mean_prop_non_native = mean(prop_non_native, na.rm = TRUE),
+      max_prop_non_native = max(prop_non_native, na.rm = TRUE),
+      min_total_taxa = min(total_taxa, na.rm = TRUE),
+      median_total_taxa = median(total_taxa, na.rm = TRUE),
+      mean_total_taxa = mean(total_taxa, na.rm = TRUE),
+      max_total_taxa = max(total_taxa, na.rm = TRUE)),
+  "Data/Processed/Final_Invert_Models/QC_prop_non_native_summary.csv")
+
+
+#### 14b. Write barrier-type summaries ###########################
+write_csv(
+  invert_total_richness_model_data %>%
+    count(barrier_type_reduced, name = "n_rows") %>%
+    mutate(response = "total_richness") %>%
+    select(response, barrier_type_reduced, n_rows),
+  "Data/Processed/Final_Invert_Models/QC_total_richness_barrier_type_counts.csv")
+
+write_csv(
+  invert_shannon_model_data %>%
+    count(barrier_type_reduced, name = "n_rows") %>%
+    mutate(response = "shannon") %>%
+    select(response, barrier_type_reduced, n_rows),
+  "Data/Processed/Final_Invert_Models/QC_shannon_barrier_type_counts.csv")
+
+write_csv(
+  invert_prop_model_data %>%
+    count(barrier_type_reduced, name = "n_rows") %>%
+    mutate(response = "prop_non_native_taxa") %>%
+    select(response, barrier_type_reduced, n_rows),
+  "Data/Processed/Final_Invert_Models/QC_prop_non_native_barrier_type_counts.csv")
+
+
+#### 14c. Combined QC summary ####################################
+combined_qc_summary <- bind_rows(
+  invert_total_richness_model_data %>%
+    summarise(
+      response = "total_richness",
+      n_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_basins = n_distinct(HYBAS_ID),
+      n_countries = n_distinct(country),
+      n_methods = n_distinct(method),
+      n_years = n_distinct(sample_year)),
+  
+  invert_shannon_model_data %>%
+    summarise(
+      response = "shannon",
+      n_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_basins = n_distinct(HYBAS_ID),
+      n_countries = n_distinct(country),
+      n_methods = n_distinct(method),
+      n_years = n_distinct(sample_year)),
+  
+  invert_prop_model_data %>%
+    summarise(
+      response = "prop_non_native_taxa",
+      n_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_basins = n_distinct(HYBAS_ID),
+      n_countries = n_distinct(country),
+      n_methods = n_distinct(method),
+      n_years = n_distinct(sample_year)))
+
+write_csv(combined_qc_summary, "Data/Processed/Final_Invert_Models/QC_combined_model_data_summary.csv")
+
+cat("\nCombined QC summary:\n")
+print(combined_qc_summary)
+
+
+#### 14d. Optional missing-value checks ##########################
+missing_value_summary <- bind_rows(
+  invert_total_richness_model_data %>%
+    summarise(
+      response = "total_richness",
+      across(
+        c(
+          value,
+          z_barrier_density,
+          z_dist_up,
+          z_dist_down,
+          z_dist_mouth,
+          z_log_population_density,
+          z_mean_temp_annual,
+          z_precip_annual,
+          z_log_river_km),
+        ~ sum(is.na(.x)),
+        .names = "n_missing_{.col}")),
+  
+  invert_shannon_model_data %>%
+    summarise(
+      response = "shannon",
+      across(
+        c(
+          value,
+          z_barrier_density,
+          z_dist_up,
+          z_dist_down,
+          z_dist_mouth,
+          z_log_population_density,
+          z_mean_temp_annual,
+          z_precip_annual,
+          z_log_river_km),
+        ~ sum(is.na(.x)),
+        .names = "n_missing_{.col}")),
+  
+  invert_prop_model_data %>%
+    summarise(
+      response = "prop_non_native_taxa",
+      across(
+        c(
+          non_native,
+          total_taxa,
+          prop_non_native,
+          z_barrier_density,
+          z_dist_up,
+          z_dist_down,
+          z_dist_mouth,
+          z_log_population_density,
+          z_mean_temp_annual,
+          z_precip_annual,
+          z_log_river_km),
+        ~ sum(is.na(.x)),
+        .names = "n_missing_{.col}")))
+
+write_csv(missing_value_summary, "Data/Processed/Final_Invert_Models/QC_missing_value_summary.csv")
+
+cat("\nMissing value summary:\n")
+print(missing_value_summary)
+
+
+#### 15. Save final model-ready datasets ########################
+saveRDS(invert_total_richness_model_data, "Data/Processed/Final_Invert_Models/invert_total_richness_final_barrier_type_reduced.rds")
+saveRDS(invert_shannon_model_data, "Data/Processed/Final_Invert_Models/invert_shannon_final_barrier_type_reduced.rds")
+saveRDS(invert_prop_model_data, "Data/Processed/Final_Invert_Models/invert_prop_non_native_final_barrier_type_reduced.rds")
+saveRDS(segment_check_site_year, "Data/Processed/Final_Invert_Models/QC_site_year_segment_assignment.rds")
+
+cat("\nSaved final datasets in Data/Processed/Final_Invert_Models\n")
+cat("Saved files:\n")
+cat(" - invert_total_richness_final_barrier_type_reduced.rds\n")
+cat(" - invert_shannon_final_barrier_type_reduced.rds\n")
+cat(" - invert_prop_non_native_final_barrier_type_reduced.rds\n")
+cat(" - QC_site_year_segment_assignment.rds\n")
+
+
+#### 16. Create final model-specific datasets ####################
+#### These are the exact datasets to send to Kelvin.
+####
+#### i models = with barrier type
+#### ii models = without barrier type
+####
+#### withtype:
+####   one row per site × year × barrier_type_reduced
+####
+#### withouttype:
+####   one row per site × year
+####   barrier density summed across dam + weir + culvert + other
+#### ============================================================
+
+make_withouttype_diversity <- function(df) {
+  
+  df %>%
+    mutate(
+      site_id_chr = as.character(site_id),
+      sample_year_chr = as.character(sample_year),
+      HYBAS_ID_chr = as.character(HYBAS_ID),
+      country_chr = as.character(country),
+      method_chr = as.character(method)) %>%
+    group_by(
+      site_id_chr,
+      sample_year_chr,
+      HYBAS_ID_chr,
+      country_chr,
+      method_chr) %>%
+    summarise(
+      value = first(value),
+      
+      n_barrier_total = sum(n_barrier, na.rm = TRUE),
+      barrier_density_total = sum(barrier_density, na.rm = TRUE),
+      log_barrier_density_total = log1p(barrier_density_total),
+      
+      z_dist_up = first(z_dist_up),
+      z_dist_down = first(z_dist_down),
+      z_dist_mouth = first(z_dist_mouth),
+      z_log_population_density = first(z_log_population_density),
+      z_mean_temp_annual = first(z_mean_temp_annual),
+      z_precip_annual = first(z_precip_annual),
+      z_log_river_km = first(z_log_river_km),
+      
+      .groups = "drop") %>%
+    mutate(
+      z_barrier_density = z_safe(log_barrier_density_total),
+      
+      site_id = factor(site_id_chr),
+      sample_year = factor(sample_year_chr),
+      HYBAS_ID = factor(HYBAS_ID_chr),
+      country = factor(country_chr),
+      method = factor(method_chr)) %>%
+    select(
+      value,
+      z_barrier_density,
+      z_dist_up,
+      z_dist_down,
+      z_dist_mouth,
+      z_log_population_density,
+      z_mean_temp_annual,
+      z_precip_annual,
+      z_log_river_km,
+      country,
+      HYBAS_ID,
+      site_id,
+      method,
+      sample_year,
+      n_barrier_total,
+      barrier_density_total,
+      log_barrier_density_total) %>%
+    filter(complete.cases(.)) %>%
+    droplevels()
+}
+
+
+make_withouttype_prop <- function(df) {
+  
+  df %>%
+    mutate(
+      site_id_chr = as.character(site_id),
+      sample_year_chr = as.character(sample_year),
+      HYBAS_ID_chr = as.character(HYBAS_ID),
+      country_chr = as.character(country),
+      method_chr = as.character(method)) %>%
+    group_by(
+      site_id_chr,
+      sample_year_chr,
+      HYBAS_ID_chr,
+      country_chr,
+      method_chr) %>%
+    summarise(
+      non_native = first(non_native),
+      total_taxa = first(total_taxa),
+      prop_non_native = first(prop_non_native),
+      
+      n_barrier_total = sum(n_barrier, na.rm = TRUE),
+      barrier_density_total = sum(barrier_density, na.rm = TRUE),
+      log_barrier_density_total = log1p(barrier_density_total),
+      
+      z_dist_up = first(z_dist_up),
+      z_dist_down = first(z_dist_down),
+      z_dist_mouth = first(z_dist_mouth),
+      z_log_population_density = first(z_log_population_density),
+      z_mean_temp_annual = first(z_mean_temp_annual),
+      z_precip_annual = first(z_precip_annual),
+      z_log_river_km = first(z_log_river_km),
+      
+      .groups = "drop") %>%
+    mutate(
+      z_barrier_density = z_safe(log_barrier_density_total),
+      
+      non_native = as.integer(non_native),
+      total_taxa = as.integer(total_taxa),
+      prop_non_native = as.numeric(prop_non_native),
+      
+      site_id = factor(site_id_chr),
+      sample_year = factor(sample_year_chr),
+      HYBAS_ID = factor(HYBAS_ID_chr),
+      country = factor(country_chr),
+      method = factor(method_chr)) %>%
+    filter(total_taxa > 0) %>%
+    select(
+      non_native,
+      total_taxa,
+      prop_non_native,
+      z_barrier_density,
+      z_dist_up,
+      z_dist_down,
+      z_dist_mouth,
+      z_log_population_density,
+      z_mean_temp_annual,
+      z_precip_annual,
+      z_log_river_km,
+      country,
+      HYBAS_ID,
+      site_id,
+      method,
+      sample_year,
+      n_barrier_total,
+      barrier_density_total,
+      log_barrier_density_total) %>%
+    filter(complete.cases(.)) %>%
+    droplevels()
+}
+
+
+#### 16a. i models: with type ####################################
+
+A1i_Richnesswithtype_data <- invert_total_richness_model_data %>%
+  mutate(
+    value = as.integer(value),
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert"))) %>%
+  droplevels()
+
+A2i_Shannonwithtype_data <- invert_shannon_model_data %>%
+  mutate(
+    value = as.numeric(value),
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert"))) %>%
+  filter(value >= 0) %>%
+  droplevels()
+
+A3i_Propwithtype_data <- invert_prop_model_data %>%
+  mutate(
+    non_native = as.integer(non_native),
+    total_taxa = as.integer(total_taxa),
+    prop_non_native = as.numeric(prop_non_native),
+    barrier_type_reduced = factor(
+      barrier_type_reduced,
+      levels = c("other", "dam", "weir", "culvert"))) %>%
+  filter(total_taxa > 0) %>%
+  droplevels()
+
+
+#### 16b. ii models: without type ###############################
+
+A1ii_Richnesswithouttype_data <- make_withouttype_diversity(
+  A1i_Richnesswithtype_data) %>%
+  mutate(value = as.integer(value))
+
+A2ii_Shannonwithouttype_data <- make_withouttype_diversity(
+  A2i_Shannonwithtype_data) %>%
+  mutate(value = as.numeric(value)) %>%
+  filter(value >= 0)
+
+A3ii_Propwithouttype_data <- make_withouttype_prop(
+  A3i_Propwithtype_data)
+
+
+#### 16c. Checks #################################################
+cat("\n============================================================\n")
+cat("FINAL MODEL-SPECIFIC DATASET CHECKS\n")
+cat("============================================================\n")
+
+cat("\nA1i richness with type rows:", nrow(A1i_Richnesswithtype_data), "\n")
+cat("A1ii richness without type rows:", nrow(A1ii_Richnesswithouttype_data), "\n")
+
+cat("\nA2i Shannon with type rows:", nrow(A2i_Shannonwithtype_data), "\n")
+cat("A2ii Shannon without type rows:", nrow(A2ii_Shannonwithouttype_data), "\n")
+
+cat("\nA3i prop with type rows:", nrow(A3i_Propwithtype_data), "\n")
+cat("A3ii prop without type rows:", nrow(A3ii_Propwithouttype_data), "\n")
+
+cat("\nBarrier type counts for A1i:\n")
+print(table(A1i_Richnesswithtype_data$barrier_type_reduced))
+
+cat("\nBarrier type counts for A2i:\n")
+print(table(A2i_Shannonwithtype_data$barrier_type_reduced))
+
+cat("\nBarrier type counts for A3i:\n")
+print(table(A3i_Propwithtype_data$barrier_type_reduced))
+
+cat("\nCheck unique site-years:\n")
+
+siteyear_check <- tibble::tibble(
+  dataset = c(
+    "A1i_Richnesswithtype",
+    "A1ii_Richnesswithouttype",
+    "A2i_Shannonwithtype",
+    "A2ii_Shannonwithouttype",
+    "A3i_Propwithtype",
+    "A3ii_Propwithouttype"),
+  n_rows = c(
+    nrow(A1i_Richnesswithtype_data),
+    nrow(A1ii_Richnesswithouttype_data),
+    nrow(A2i_Shannonwithtype_data),
+    nrow(A2ii_Shannonwithouttype_data),
+    nrow(A3i_Propwithtype_data),
+    nrow(A3ii_Propwithouttype_data)),
+  n_unique_siteyears = c(
+    n_distinct(A1i_Richnesswithtype_data$site_id,
+               A1i_Richnesswithtype_data$sample_year),
+    n_distinct(A1ii_Richnesswithouttype_data$site_id,
+               A1ii_Richnesswithouttype_data$sample_year),
+    n_distinct(A2i_Shannonwithtype_data$site_id,
+               A2i_Shannonwithtype_data$sample_year),
+    n_distinct(A2ii_Shannonwithouttype_data$site_id,
+               A2ii_Shannonwithouttype_data$sample_year),
+    n_distinct(A3i_Propwithtype_data$site_id,
+               A3i_Propwithtype_data$sample_year),
+    n_distinct(A3ii_Propwithouttype_data$site_id,
+               A3ii_Propwithouttype_data$sample_year)))
+
+print(siteyear_check)
+
+write_csv(
+  siteyear_check,
+  "Data/Processed/Final_Invert_Models/QC_A1_A2_A3_siteyear_check.csv")
+
+
+#### 16d. Save model-specific datasets ##########################
+
+saveRDS(
+  A1i_Richnesswithtype_data,
+  "Data/Processed/Final_Invert_Models/A1i_Richnesswithtype_data.rds")
+saveRDS(
+  A1ii_Richnesswithouttype_data,
+  "Data/Processed/Final_Invert_Models/A1ii_Richnesswithouttype_data.rds")
+saveRDS(
+  A2i_Shannonwithtype_data,
+  "Data/Processed/Final_Invert_Models/A2i_Shannonwithtype_data.rds")
+saveRDS(
+  A2ii_Shannonwithouttype_data,
+  "Data/Processed/Final_Invert_Models/A2ii_Shannonwithouttype_data.rds")
+
+saveRDS(
+  A3i_Propwithtype_data,
+  "Data/Processed/Final_Invert_Models/A3i_Propwithtype_data.rds")
+
+saveRDS(
+  A3ii_Propwithouttype_data,
+  "Data/Processed/Final_Invert_Models/A3ii_Propwithouttype_data.rds")
+
+write_csv(
+  A1i_Richnesswithtype_data,
+  "Data/Processed/Final_Invert_Models/A1i_Richnesswithtype_data.csv")
+
+write_csv(
+  A1ii_Richnesswithouttype_data,
+  "Data/Processed/Final_Invert_Models/A1ii_Richnesswithouttype_data.csv")
+
+write_csv(
+  A2i_Shannonwithtype_data,
+  "Data/Processed/Final_Invert_Models/A2i_Shannonwithtype_data.csv")
+
+write_csv(
+  A2ii_Shannonwithouttype_data,
+  "Data/Processed/Final_Invert_Models/A2ii_Shannonwithouttype_data.csv")
+
+write_csv(
+  A3i_Propwithtype_data,
+  "Data/Processed/Final_Invert_Models/A3i_Propwithtype_data.csv")
+
+write_csv(
+  A3ii_Propwithouttype_data,
+  "Data/Processed/Final_Invert_Models/A3ii_Propwithouttype_data.csv")
+
+cat("\nSaved six final A1/A2/A3 model-specific datasets.\n")
+
+
+
+
+
+

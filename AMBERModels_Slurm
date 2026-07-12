@@ -1,5 +1,5 @@
 
-# Model 1
+# Model 1 ########
 # run_A1i_Richnesswithtype.slurm
 
 #!/bin/bash
@@ -18,6 +18,118 @@ module load R/4.4.2
 cd /users/40294295/AfterIsmael
 
 Rscript Scripts/run_one_A1_A2_A3_model.R A1i_Richnesswithtype
+
+
+# Model 2 ########
+#Scripts/run_A1ii_Richnesswithouttype.slurm
+
+#!/bin/bash
+#SBATCH --job-name=A1ii_Rich
+#SBATCH --partition=k2-lowpri
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=30-00:00:00
+#SBATCH --output=Logs/A1ii_Richnesswithouttype_%j.out
+#SBATCH --error=Logs/A1ii_Richnesswithouttype_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=40294295@ads.qub.ac.uk
+
+module load R/4.4.2
+
+cd /users/40294295/AfterIsmael
+
+Rscript Scripts/run_one_A1_A2_A3_model.R A1ii_Richnesswithouttype
+
+
+
+# Model 3 ########
+#Scripts/run_A2i_Shannonwithtype.slurm
+
+#!/bin/bash
+#SBATCH --job-name=A2i_Shan
+#SBATCH --partition=k2-lowpri
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=30-00:00:00
+#SBATCH --output=Logs/A2i_Shannonwithtype_%j.out
+#SBATCH --error=Logs/A2i_Shannonwithtype_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=40294295@ads.qub.ac.uk
+
+module load R/4.4.2
+
+cd /users/40294295/AfterIsmael
+
+Rscript Scripts/run_one_A1_A2_A3_model.R A2i_Shannonwithtype
+
+
+
+
+# Model 4 ########
+#Scripts/run_A2ii_Shannonwithouttype.slurm
+
+#!/bin/bash
+#SBATCH --job-name=A2i_Shan
+#SBATCH --partition=k2-lowpri
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=30-00:00:00
+#SBATCH --output=Logs/A2i_Shannonwithtype_%j.out
+#SBATCH --error=Logs/A2i_Shannonwithtype_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=40294295@ads.qub.ac.uk
+
+module load R/4.4.2
+
+cd /users/40294295/AfterIsmael
+
+Rscript Scripts/run_one_A1_A2_A3_model.R A2ii_Shannonwithouttype
+
+
+
+
+# Model 5 ########
+#Scripts/run_A3i_Propwithtype.slurm
+
+#!/bin/bash
+#SBATCH --job-name=A3i_Prop
+#SBATCH --partition=k2-lowpri
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=30-00:00:00
+#SBATCH --output=Logs/A3i_Propwithtype_%j.out
+#SBATCH --error=Logs/A3i_Propwithtype_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=40294295@ads.qub.ac.uk
+
+module load R/4.4.2
+
+cd /users/40294295/AfterIsmael
+
+Rscript Scripts/run_one_A1_A2_A3_model.R A3i_Propwithtype
+
+
+
+# Model 6 ########
+#Scripts/run_A3ii_Propwithouttype.slurm
+
+#!/bin/bash
+#SBATCH --job-name=A3i_Prop
+#SBATCH --partition=k2-lowpri
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=30-00:00:00
+#SBATCH --output=Logs/A3i_Propwithtype_%j.out
+#SBATCH --error=Logs/A3i_Propwithtype_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=40294295@ads.qub.ac.uk
+
+module load R/4.4.2
+
+cd /users/40294295/AfterIsmael
+
+Rscript Scripts/run_one_A1_A2_A3_model.R A3i_Propwithouttype
+
 
 
 

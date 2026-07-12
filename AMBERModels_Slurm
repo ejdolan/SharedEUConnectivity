@@ -1,22 +1,23 @@
 
-# Slurm
+# Model 1
+# run_A1i_Richnesswithtype.slurm
 
 #!/bin/bash
-#SBATCH --job-name=inv_final_bar
+#SBATCH --job-name=A1i_Rich
 #SBATCH --partition=k2-lowpri
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=128G
 #SBATCH --time=30-00:00:00
-#SBATCH --output=Logs/inv_final_bar_%j.out
-#SBATCH --error=Logs/inv_final_bar_%j.err
+#SBATCH --output=Logs/A1i_Richnesswithtype_%j.out
+#SBATCH --error=Logs/A1i_Richnesswithtype_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=edolan05@qub.ac.uk
-
-set -euo pipefail
+#SBATCH --mail-user=40294295@ads.qub.ac.uk
 
 module load R/4.4.2
 
-cd /users/40294295/AI
+cd /users/40294295/AfterIsmael
 
-Rscript Scripts/run_final_invert_barrier_models.R
+Rscript Scripts/run_one_A1_A2_A3_model.R A1i_Richnesswithtype
+
+
 

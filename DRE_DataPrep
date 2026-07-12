@@ -1,0 +1,1196 @@
+
+
+
+#### B) DRE analysis ##############
+# here we are working with the next closest barrier for a meta-regression
+# if this doesnt work we can instead do any removal(s) within 1km and just use bayesian modelling
+
+
+
+## was the nearest barrier removed?
+#### ============================================================
+#### SCRIPT 03: AMBER-DRE CLOSEST REMOVED BARRIER EVENT PAIRS
+#### ============================================================
+#### Goal:
+####   1. Match DRE removals to AMBER barriers using HydroRIVERS.
+####   2. For each invertebrate community, find the closest AMBER barrier.
+####   3. Identify whether that closest barrier was removed.
+####   4. Pair community metrics from last sample before removal to first
+####      sample after removal.
+####   5. Keep recovery trajectories for all years after removal until
+####      another removal occurs.
+####
+#### Key outputs:
+####   - amber_dre_matched_removed_barriers.csv
+####   - community_amber_barrier_rankings.csv
+####   - closest_removed_barrier_intervals.csv
+####   - closest_removed_barrier_effect_sizes.csv
+####   - closest_removed_barrier_recovery_trajectories.csv
+#### ============================================================
+
+
+#### 0. Setup ####################################################
+setwd("C:/Users/User/OneDrive - Queen's University Belfast/PhD/Chapters/Chapter 3 European Connectivity (Inverts)/UpToDateWork/EUConnectivity_Inverts")
+
+library(sf)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readr)
+library(vegan)
+
+sf_use_s2(FALSE)
+options(scipen = 999)
+
+out_dir <- "Data/Processed/DRE_ClosestBarrierEvents"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+#### 1. Helper functions ########################################
+
+parse_num <- function(x) {
+  x <- str_trim(as.character(x))
+  x <- na_if(x, "")
+  x <- gsub(",", ".", x)
+  suppressWarnings(as.numeric(x))
+}
+
+clean_barrier_type <- function(x) {
+  x <- str_trim(tolower(as.character(x)))
+  case_when(
+    str_detect(x, "dam")     ~ "dam",
+    str_detect(x, "weir")    ~ "weir",
+    str_detect(x, "culvert") ~ "culvert",
+    str_detect(x, "sluice")  ~ "sluice",
+    str_detect(x, "ford")    ~ "ford",
+    str_detect(x, "ramp")    ~ "ramp",
+    TRUE                     ~ "other"
+  )
+}
+
+reduce_barrier_type <- function(x) {
+  case_when(
+    x %in% c("dam", "weir", "culvert") ~ x,
+    TRUE ~ "other"
+  )
+}
+
+safe_log_ratio <- function(post, pre, c = 0.5) {
+  log((post + c) / (pre + c))
+}
+
+safe_diff <- function(post, pre) {
+  post - pre
+}
+
+
+#### 2. Manual along-line position function ######################
+#### This avoids relying on st_line_locate_point(), which was not available
+#### in your local lwgeom/sf setup.
+####
+#### It estimates the position of a point along its snapped HydroRIVERS
+#### segment by projecting the point to the nearest piece of the line.
+
+point_position_along_line <- function(line_geom, point_geom) {
+  
+  line_coords <- sf::st_coordinates(line_geom)
+  point_coords <- sf::st_coordinates(point_geom)[1, c("X", "Y")]
+  
+  if ("L1" %in% colnames(line_coords)) {
+    line_parts <- split(as.data.frame(line_coords), line_coords[, "L1"])
+  } else {
+    line_parts <- list(as.data.frame(line_coords))
+  }
+  
+  best_dist_sq <- Inf
+  best_distance_along <- NA_real_
+  part_results <- list()
+  
+  for (part_i in seq_along(line_parts)) {
+    
+    coords <- line_parts[[part_i]]
+    xy <- as.matrix(coords[, c("X", "Y")])
+    
+    if (nrow(xy) < 2) next
+    
+    seg_start <- xy[-nrow(xy), , drop = FALSE]
+    seg_end <- xy[-1, , drop = FALSE]
+    seg_vec <- seg_end - seg_start
+    seg_len <- sqrt(rowSums(seg_vec^2))
+    
+    valid <- seg_len > 0
+    
+    if (!any(valid)) next
+    
+    seg_start <- seg_start[valid, , drop = FALSE]
+    seg_vec <- seg_vec[valid, , drop = FALSE]
+    seg_len <- seg_len[valid]
+    
+    cum_len_start <- c(0, cumsum(seg_len))[seq_along(seg_len)]
+    
+    px <- point_coords[["X"]]
+    py <- point_coords[["Y"]]
+    
+    point_vec <- cbind(
+      px - seg_start[, "X"],
+      py - seg_start[, "Y"]
+    )
+    
+    seg_len_sq <- seg_len^2
+    
+    t <- rowSums(point_vec * seg_vec) / seg_len_sq
+    t <- pmax(0, pmin(1, t))
+    
+    proj <- seg_start + seg_vec * t
+    
+    dist_sq <- (px - proj[, "X"])^2 + (py - proj[, "Y"])^2
+    
+    best_seg <- which.min(dist_sq)
+    
+    part_results[[part_i]] <- list(
+      part_length = sum(seg_len),
+      best_dist_sq = dist_sq[best_seg],
+      best_distance_along_part =
+        cum_len_start[best_seg] + t[best_seg] * seg_len[best_seg]
+    )
+  }
+  
+  if (length(part_results) == 0) {
+    return(
+      tibble(
+        line_fraction = NA_real_,
+        line_distance_m = NA_real_
+      )
+    )
+  }
+  
+  part_lengths <- purrr::map_dbl(part_results, "part_length")
+  part_offsets <- c(0, cumsum(part_lengths))[seq_along(part_lengths)]
+  
+  for (part_i in seq_along(part_results)) {
+    
+    candidate_dist_sq <- part_results[[part_i]]$best_dist_sq
+    candidate_distance_along <-
+      part_offsets[part_i] + part_results[[part_i]]$best_distance_along_part
+    
+    if (candidate_dist_sq < best_dist_sq) {
+      best_dist_sq <- candidate_dist_sq
+      best_distance_along <- candidate_distance_along
+    }
+  }
+  
+  total_line_length <- sum(part_lengths)
+  
+  tibble(
+    line_fraction = ifelse(
+      total_line_length > 0,
+      best_distance_along / total_line_length,
+      NA_real_
+    ),
+    line_distance_m = best_distance_along
+  )
+}
+
+
+add_position_along_segment <- function(points_sf, rivers_sf) {
+  
+  out_list <- vector("list", nrow(points_sf))
+  
+  for (i in seq_len(nrow(points_sf))) {
+    
+    h <- points_sf$HYRIV_ID[i]
+    
+    river_i <- rivers_sf %>%
+      filter(HYRIV_ID == h)
+    
+    if (nrow(river_i) == 0) {
+      out_list[[i]] <- st_drop_geometry(points_sf[i, ]) %>%
+        mutate(
+          line_fraction = NA_real_,
+          line_distance_m = NA_real_
+        )
+      next
+    }
+    
+    line_i <- st_geometry(river_i)[[1]]
+    point_i <- st_geometry(points_sf[i, ])[[1]]
+    
+    pos_i <- point_position_along_line(line_i, point_i)
+    
+    out_list[[i]] <- st_drop_geometry(points_sf[i, ]) %>%
+      mutate(
+        line_fraction = pos_i$line_fraction,
+        line_distance_m = pos_i$line_distance_m
+      )
+  }
+  
+  bind_rows(out_list)
+}
+
+
+#### 3. Load data ################################################
+getwd()
+setwd("C:/Users/User/OneDrive - Queen's University Belfast/PhD/Chapters/Chapter 3 European Connectivity (Inverts)/UpToDateWork/EUConnectivity_Inverts")
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+
+dir.exists(out_dir)
+
+setwd("C:/Users/User/OneDrive - Queen's University Belfast/PhD/Chapters/Chapter 3 European Connectivity (Inverts)/UpToDateWork/EUConnectivity_Inverts")
+
+out_dir <- "Data/Processed/DRE_ClosestBarrierEvents"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+dir.exists(out_dir)
+
+inverts_df <- read_xlsx("Data/Inverts data/Global_dataset.xlsx")
+
+amber_raw_sf <- read_sf("Data/AMBER data/AMBER map.shp")
+
+dre_removed_df <- read_xlsx(
+  "Data/Removed Barriers/Copy of DRE database_Ellen Dolan - this is what we used.xlsx"
+)
+
+hydrobasins_sf <- read_sf("Data/HydroBasins EU/hybas_eu_lev07_v1c.shp") %>%
+  st_make_valid() %>%
+  mutate(HYBAS_ID = as.character(HYBAS_ID))
+
+hydrorivers_sf <- read_sf("Data/HydroRivers EU/HydroRIVERS_v10_eu.shp") %>%
+  mutate(
+    HYRIV_ID = as.character(HYRIV_ID),
+    NEXT_DOWN = as.character(NEXT_DOWN),
+    MAIN_RIV = as.character(MAIN_RIV)
+  )
+
+
+#### 4. Clean invertebrate data and calculate community metrics ###
+
+inverts_clean <- inverts_df %>%
+  transmute(
+    site_id = as.character(site_id),
+    sample_year = suppressWarnings(as.integer(year)),
+    taxon = as.character(taxon),
+    abundance_num = suppressWarnings(as.numeric(abundance)),
+    country = as.character(country),
+    method = as.character(Method),
+    Longitude_X = parse_num(Longitude_X),
+    Latitude_Y = parse_num(Latitude_Y),
+    alien_status = case_when(
+      str_trim(tolower(as.character(Alien))) %in%
+        c("yes", "y", "alien", "non-native", "nonnative",
+          "non native", "introduced", "invasive") ~ "non_native",
+      str_trim(tolower(as.character(Alien))) %in%
+        c("no", "n", "native") ~ "native",
+      TRUE ~ "unknown"
+    )
+  ) %>%
+  filter(
+    !is.na(site_id),
+    !is.na(sample_year),
+    !is.na(taxon),
+    !is.na(Longitude_X),
+    !is.na(Latitude_Y)
+  )
+
+community_taxon_df <- inverts_clean %>%
+  mutate(
+    abundance_num = if_else(is.na(abundance_num), 0, abundance_num),
+    alien_status = case_when(
+      alien_status %in% c("native", "non_native") ~ alien_status,
+      TRUE ~ "unknown"
+    )
+  ) %>%
+  group_by(site_id, sample_year, country, method, Longitude_X, Latitude_Y, taxon) %>%
+  summarise(
+    abundance_taxon = sum(abundance_num, na.rm = TRUE),
+    alien_status = first(na.omit(alien_status)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    alien_status = if_else(is.na(alien_status), "unknown", alien_status)
+  )
+
+community_metrics_df <- community_taxon_df %>%
+  group_by(site_id, sample_year, country, method) %>%
+  summarise(
+    Longitude_X = mean(Longitude_X, na.rm = TRUE),
+    Latitude_Y = mean(Latitude_Y, na.rm = TRUE),
+    
+    total_richness = n_distinct(taxon),
+    
+    shannon = vegan::diversity(
+      abundance_taxon,
+      index = "shannon"
+    ),
+    
+    n_native_taxa = n_distinct(taxon[alien_status == "native"]),
+    n_non_native_taxa = n_distinct(taxon[alien_status == "non_native"]),
+    n_unknown_taxa = n_distinct(taxon[alien_status == "unknown"]),
+    
+    total_known_taxa = n_native_taxa + n_non_native_taxa,
+    
+    prop_non_native = if_else(
+      total_known_taxa > 0,
+      n_non_native_taxa / total_known_taxa,
+      NA_real_
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    community_id = paste(site_id, sample_year, sep = "_")
+  )
+
+community_points_sf <- community_metrics_df %>%
+  st_as_sf(
+    coords = c("Longitude_X", "Latitude_Y"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+
+#### 5. Clean AMBER and DRE #####################################
+#### Helper functions needed before cleaning AMBER/DRE ###########
+
+clean_barrier_type <- function(x) {
+  x <- str_trim(tolower(as.character(x)))
+  
+  case_when(
+    str_detect(x, "dam")     ~ "dam",
+    str_detect(x, "weir")    ~ "weir",
+    str_detect(x, "culvert") ~ "culvert",
+    str_detect(x, "sluice")  ~ "sluice",
+    str_detect(x, "ford")    ~ "ford",
+    str_detect(x, "ramp")    ~ "ramp",
+    TRUE                     ~ "other"
+  )
+}
+
+reduce_barrier_type <- function(x) {
+  case_when(
+    x %in% c("dam", "weir", "culvert") ~ x,
+    TRUE ~ "other"
+  )
+}
+
+amber_clean_sf <- amber_raw_sf %>%
+  mutate(
+    AMBER_ID = row_number(),
+    amber_type = clean_barrier_type(type),
+    amber_type_reduced = reduce_barrier_type(amber_type))
+
+
+colnames(dre_removed_df)
+#colnames(dre_removed_df)[4] <- "YearRemoved"
+#colnames(dre_removed_df)[6] <- "Lat"
+#colnames(dre_removed_df)[7] <- "Long"
+
+dre_clean_df <- dre_removed_df %>%
+  mutate(
+    Long = parse_num(Long),
+    Lat = parse_num(Lat),
+    YearRemoved = suppressWarnings(as.integer(YearRemoved)),
+    removal_type = clean_barrier_type(Type),
+    removal_type_reduced = reduce_barrier_type(removal_type),
+    removal_id = row_number()) %>%
+  filter(!is.na(Long), !is.na(Lat), !is.na(YearRemoved))
+
+dre_sf <- dre_clean_df %>%
+  st_as_sf(
+    coords = c("Long", "Lat"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+
+#### 6. Keep only points inside HydroBASINS L7 ###################
+
+community_basins_sf <- st_join(
+  community_points_sf,
+  hydrobasins_sf %>% select(HYBAS_ID),
+  join = st_intersects) %>%
+  filter(!is.na(HYBAS_ID))
+
+amber_basins_sf <- st_join(
+  amber_clean_sf,
+  hydrobasins_sf %>% select(HYBAS_ID),
+  join = st_intersects) %>%
+  filter(!is.na(HYBAS_ID))
+
+dre_basins_sf <- st_join(
+  dre_sf,
+  hydrobasins_sf %>% select(HYBAS_ID),
+  join = st_intersects) %>%
+  filter(!is.na(HYBAS_ID))
+
+
+#### 7. Snap communities, AMBER, and DRE to HydroRIVERS ##########
+
+snap_to_river <- function(points_sf, rivers_sf, threshold_m = 2000) {
+  
+  pts_3035 <- st_transform(points_sf, 3035)
+  rivers_3035 <- st_transform(rivers_sf, 3035)
+  
+  nearest_idx <- st_nearest_feature(pts_3035, rivers_3035)
+  
+  dist_to_river_m <- as.numeric(
+    st_distance(
+      pts_3035,
+      rivers_3035[nearest_idx, ],
+      by_element = TRUE
+    )
+  )
+  
+  keep <- dist_to_river_m <= threshold_m
+  
+  out <- bind_cols(
+    st_drop_geometry(pts_3035[keep, ]),
+    st_drop_geometry(rivers_3035[nearest_idx[keep], ]) %>%
+      select(HYRIV_ID, NEXT_DOWN, MAIN_RIV, LENGTH_KM, DIST_DN_KM)
+  )
+  
+  out$dist_to_river_m <- dist_to_river_m[keep]
+  
+  st_as_sf(
+    out,
+    coords = c("Longitude_X", "Latitude_Y"),
+    crs = 3035,
+    remove = FALSE
+  )
+}
+
+snap_barrier_to_river <- function(points_sf, rivers_sf, x_col, y_col, threshold_m = 2000) {
+  
+  pts_3035 <- st_transform(points_sf, 3035)
+  rivers_3035 <- st_transform(rivers_sf, 3035)
+  
+  nearest_idx <- st_nearest_feature(pts_3035, rivers_3035)
+  
+  dist_to_river_m <- as.numeric(
+    st_distance(
+      pts_3035,
+      rivers_3035[nearest_idx, ],
+      by_element = TRUE
+    )
+  )
+  
+  keep <- dist_to_river_m <= threshold_m
+  
+  out <- bind_cols(
+    st_drop_geometry(pts_3035[keep, ]),
+    st_drop_geometry(rivers_3035[nearest_idx[keep], ]) %>%
+      select(HYRIV_ID, NEXT_DOWN, MAIN_RIV, LENGTH_KM, DIST_DN_KM)
+  )
+  
+  out$dist_to_river_m <- dist_to_river_m[keep]
+  
+  # use original projected geometry from snapped points
+  st_as_sf(out, geometry = st_geometry(pts_3035[keep, ]), crs = 3035)
+}
+
+SNAP_THRESHOLD_M <- 2000
+
+community_rivers_sf <- snap_barrier_to_river(
+  community_basins_sf,
+  hydrorivers_sf,
+  x_col = "Longitude_X",
+  y_col = "Latitude_Y",
+  threshold_m = SNAP_THRESHOLD_M
+) %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    HYRIV_ID = as.character(HYRIV_ID)
+  )
+
+amber_rivers_sf <- snap_barrier_to_river(
+  amber_basins_sf,
+  hydrorivers_sf,
+  x_col = NULL,
+  y_col = NULL,
+  threshold_m = SNAP_THRESHOLD_M
+) %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    HYRIV_ID = as.character(HYRIV_ID)
+  )
+
+dre_rivers_sf <- snap_barrier_to_river(
+  dre_basins_sf,
+  hydrorivers_sf,
+  x_col = NULL,
+  y_col = NULL,
+  threshold_m = SNAP_THRESHOLD_M
+) %>%
+  mutate(
+    HYBAS_ID = as.character(HYBAS_ID),
+    HYRIV_ID = as.character(HYRIV_ID)
+  )
+
+
+#### 8. QC: one HydroRIVERS segment per object ###################
+
+community_segment_check <- community_rivers_sf %>%
+  st_drop_geometry() %>%
+  distinct(community_id, site_id, sample_year, HYRIV_ID) %>%
+  count(community_id, site_id, sample_year, name = "n_hyriv_segments")
+
+amber_segment_check <- amber_rivers_sf %>%
+  st_drop_geometry() %>%
+  distinct(AMBER_ID, HYRIV_ID) %>%
+  count(AMBER_ID, name = "n_hyriv_segments")
+
+dre_segment_check <- dre_rivers_sf %>%
+  st_drop_geometry() %>%
+  distinct(removal_id, HYRIV_ID) %>%
+  count(removal_id, name = "n_hyriv_segments")
+
+write_csv(
+  community_segment_check,
+  file.path(out_dir, "QC_community_segment_check.csv")
+)
+
+write_csv(
+  amber_segment_check,
+  file.path(out_dir, "QC_amber_segment_check.csv")
+)
+
+write_csv(
+  dre_segment_check,
+  file.path(out_dir, "QC_dre_segment_check.csv")
+)
+
+cat("\n--- Segment QC ---\n")
+cat("Communities with >1 HYRIV_ID:",
+    sum(community_segment_check$n_hyriv_segments > 1), "\n")
+cat("AMBER barriers with >1 HYRIV_ID:",
+    sum(amber_segment_check$n_hyriv_segments > 1), "\n")
+cat("DRE removals with >1 HYRIV_ID:",
+    sum(dre_segment_check$n_hyriv_segments > 1), "\n")
+
+
+#### 9. Calculate along-segment position #########################
+
+rivers_3035 <- st_transform(hydrorivers_sf, 3035) %>%
+  select(HYRIV_ID, MAIN_RIV, LENGTH_KM, geometry)
+
+community_position_df <- add_position_along_segment(
+  community_rivers_sf,
+  rivers_3035
+)
+
+amber_position_df <- add_position_along_segment(
+  amber_rivers_sf,
+  rivers_3035
+)
+
+dre_position_df <- add_position_along_segment(
+  dre_rivers_sf,
+  rivers_3035
+)
+
+
+#### 10. Match DRE removals to AMBER barriers ####################
+#### A DRE removal is treated as corresponding to an AMBER barrier if:
+####   - same HYRIV_ID
+####   - within 1 km along the river segment
+####
+#### If more than one AMBER barrier matches a DRE removal, keep closest.
+
+amber_dre_matches_all <- dre_position_df %>%
+  select(
+    removal_id,
+    YearRemoved,
+    removal_type,
+    removal_type_reduced,
+    DRE_HYBAS_ID = HYBAS_ID,
+    HYRIV_ID,
+    MAIN_RIV,
+    dre_line_distance_m = line_distance_m,
+    dre_dist_to_river_m = dist_to_river_m
+  ) %>%
+  inner_join(
+    amber_position_df %>%
+      select(
+        AMBER_ID,
+        amber_type,
+        amber_type_reduced,
+        AMBER_HYBAS_ID = HYBAS_ID,
+        HYRIV_ID,
+        amber_line_distance_m = line_distance_m,
+        amber_dist_to_river_m = dist_to_river_m
+      ),
+    by = "HYRIV_ID",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    amber_dre_along_distance_m =
+      abs(dre_line_distance_m - amber_line_distance_m),
+    amber_dre_along_distance_km = amber_dre_along_distance_m / 1000,
+    amber_dre_type_match =
+      removal_type_reduced == amber_type_reduced
+  ) %>%
+  filter(amber_dre_along_distance_m <= 1000) %>%
+  arrange(removal_id, amber_dre_along_distance_m)
+
+amber_dre_best_match <- amber_dre_matches_all %>%
+  group_by(removal_id) %>%
+  slice_min(
+    order_by = amber_dre_along_distance_m,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+removed_amber_barriers <- amber_dre_best_match %>%
+  transmute(
+    AMBER_ID,
+    matched_removal_id = removal_id,
+    YearRemoved,
+    removal_type,
+    removal_type_reduced,
+    amber_type,
+    amber_type_reduced,
+    HYRIV_ID,
+    MAIN_RIV,
+    AMBER_HYBAS_ID,
+    DRE_HYBAS_ID,
+    amber_dre_along_distance_m,
+    amber_dre_along_distance_km,
+    amber_dre_type_match
+  ) %>%
+  distinct()
+
+write_csv(
+  amber_dre_matches_all,
+  file.path(out_dir, "amber_dre_all_matches_within_1km_along_segment.csv")
+)
+
+write_csv(
+  amber_dre_best_match,
+  file.path(out_dir, "amber_dre_best_match_per_dre_removal.csv")
+)
+
+write_csv(
+  removed_amber_barriers,
+  file.path(out_dir, "amber_dre_matched_removed_barriers.csv")
+)
+
+saveRDS(
+  removed_amber_barriers,
+  file.path(out_dir, "amber_dre_matched_removed_barriers.rds")
+)
+
+
+#### 11. Rank AMBER barriers by distance to each community #######
+#### For each community sample, rank all AMBER barriers on the same HYRIV_ID.
+#### Then flag whether each barrier was matched to a DRE removal.
+
+community_amber_rankings <- community_position_df %>%
+  select(
+    community_id,
+    site_id,
+    sample_year,
+    country,
+    method,
+    community_HYBAS_ID = HYBAS_ID,
+    HYRIV_ID,
+    MAIN_RIV,
+    community_line_distance_m = line_distance_m,
+    total_richness,
+    shannon,
+    prop_non_native,
+    total_known_taxa,
+    n_non_native_taxa
+  ) %>%
+  inner_join(
+    amber_position_df %>%
+      select(
+        AMBER_ID,
+        amber_type,
+        amber_type_reduced,
+        amber_HYBAS_ID = HYBAS_ID,
+        HYRIV_ID,
+        amber_line_distance_m = line_distance_m,
+        amber_dist_to_river_m = dist_to_river_m
+      ),
+    by = "HYRIV_ID",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    community_amber_distance_m =
+      abs(community_line_distance_m - amber_line_distance_m),
+    community_amber_distance_km =
+      community_amber_distance_m / 1000
+  ) %>%
+  left_join(
+    removed_amber_barriers %>%
+      select(
+        AMBER_ID,
+        matched_removal_id,
+        YearRemoved,
+        removal_type,
+        removal_type_reduced,
+        amber_dre_along_distance_m,
+        amber_dre_type_match
+      ),
+    by = "AMBER_ID"
+  ) %>%
+  mutate(
+    was_removed = !is.na(matched_removal_id)
+  ) %>%
+  group_by(community_id) %>%
+  arrange(community_amber_distance_m, .by_group = TRUE) %>%
+  mutate(
+    barrier_rank_from_community = row_number()
+  ) %>%
+  ungroup()
+
+write_csv(
+  community_amber_rankings,
+  file.path(out_dir, "community_amber_barrier_rankings.csv")
+)
+
+saveRDS(
+  community_amber_rankings,
+  file.path(out_dir, "community_amber_barrier_rankings.rds")
+)
+
+
+#### 12. Identify closest removed barrier per community sample ####
+
+closest_removed_barrier_by_sample <- community_amber_rankings %>%
+  filter(was_removed) %>%
+  group_by(community_id) %>%
+  slice_min(
+    order_by = community_amber_distance_m,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  rename(
+    closest_removed_AMBER_ID = AMBER_ID,
+    closest_removed_removal_id = matched_removal_id,
+    closest_removed_year = YearRemoved,
+    closest_removed_distance_m = community_amber_distance_m,
+    closest_removed_distance_km = community_amber_distance_km,
+    closest_removed_barrier_rank = barrier_rank_from_community
+  )
+
+closest_overall_barrier_by_sample <- community_amber_rankings %>%
+  group_by(community_id) %>%
+  slice_min(
+    order_by = community_amber_distance_m,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  transmute(
+    community_id,
+    closest_overall_AMBER_ID = AMBER_ID,
+    closest_overall_type = amber_type_reduced,
+    closest_overall_distance_m = community_amber_distance_m,
+    closest_overall_was_removed = was_removed,
+    closest_overall_removed_year = YearRemoved
+  )
+
+community_samples_with_closest <- community_position_df %>%
+  st_drop_geometry() %>%
+  left_join(
+    closest_overall_barrier_by_sample,
+    by = "community_id"
+  ) %>%
+  left_join(
+    closest_removed_barrier_by_sample %>%
+      select(
+        community_id,
+        closest_removed_AMBER_ID,
+        closest_removed_removal_id,
+        closest_removed_year,
+        closest_removed_distance_m,
+        closest_removed_distance_km,
+        closest_removed_barrier_rank,
+        removal_type_reduced,
+        amber_dre_type_match
+      ),
+    by = "community_id"
+  )
+
+write_csv(
+  community_samples_with_closest,
+  file.path(out_dir, "community_samples_with_closest_barrier_status.csv")
+)
+
+saveRDS(
+  community_samples_with_closest,
+  file.path(out_dir, "community_samples_with_closest_barrier_status.rds")
+)
+
+
+#### 13. Build consecutive sample intervals ######################
+#### Each row is:
+####   site_id previous sample year -> current sample year
+####
+#### Then identify removals that happened between those samples.
+
+community_intervals <- community_samples_with_closest %>%
+  arrange(site_id, sample_year) %>%
+  group_by(site_id) %>%
+  mutate(
+    pre_community_id = lag(community_id),
+    pre_year = lag(sample_year),
+    pre_total_richness = lag(total_richness),
+    pre_shannon = lag(shannon),
+    pre_prop_non_native = lag(prop_non_native),
+    pre_total_known_taxa = lag(total_known_taxa),
+    pre_n_non_native_taxa = lag(n_non_native_taxa),
+    
+    post_community_id = community_id,
+    post_year = sample_year,
+    post_total_richness = total_richness,
+    post_shannon = shannon,
+    post_prop_non_native = prop_non_native,
+    post_total_known_taxa = total_known_taxa,
+    post_n_non_native_taxa = n_non_native_taxa
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(pre_year), post_year > pre_year) %>%
+  select(
+    site_id,
+    country,
+    method,
+    HYBAS_ID,
+    HYRIV_ID,
+    MAIN_RIV,
+    pre_community_id,
+    post_community_id,
+    pre_year,
+    post_year,
+    pre_total_richness,
+    post_total_richness,
+    pre_shannon,
+    post_shannon,
+    pre_prop_non_native,
+    post_prop_non_native,
+    pre_total_known_taxa,
+    post_total_known_taxa,
+    pre_n_non_native_taxa,
+    post_n_non_native_taxa
+  )
+
+#### Candidate removal events for each site.
+#### We use the community-barrier rankings but collapse to site-level because
+#### a site may have multiple sample years.
+
+site_removed_barriers <- community_amber_rankings %>%
+  filter(was_removed) %>%
+  group_by(
+    site_id,
+    AMBER_ID,
+    matched_removal_id,
+    YearRemoved,
+    removal_type_reduced
+  ) %>%
+  summarise(
+    min_distance_m = min(community_amber_distance_m, na.rm = TRUE),
+    best_rank_observed = min(barrier_rank_from_community, na.rm = TRUE),
+    HYRIV_ID = first(HYRIV_ID),
+    MAIN_RIV = first(MAIN_RIV),
+    .groups = "drop"
+  ) %>%
+  arrange(site_id, YearRemoved, min_distance_m)
+
+interval_removal_events <- community_intervals %>%
+  left_join(
+    site_removed_barriers,
+    by = c("site_id", "HYRIV_ID", "MAIN_RIV"),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(YearRemoved),
+    YearRemoved > pre_year,
+    YearRemoved <= post_year
+  ) %>%
+  group_by(site_id, pre_year, post_year) %>%
+  mutate(
+    n_removals_in_interval = n_distinct(matched_removal_id),
+    closest_removed_in_interval_m =
+      min(min_distance_m, na.rm = TRUE)
+  ) %>%
+  arrange(site_id, pre_year, post_year, min_distance_m) %>%
+  ungroup()
+
+closest_removed_barrier_intervals <- interval_removal_events %>%
+  group_by(site_id, pre_year, post_year) %>%
+  slice_min(
+    order_by = min_distance_m,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  mutate(
+    single_removal_interval = n_removals_in_interval == 1,
+    multiple_removals_interval = n_removals_in_interval > 1,
+    years_between_samples = post_year - pre_year,
+    years_removal_after_pre = YearRemoved - pre_year,
+    years_post_after_removal = post_year - YearRemoved
+  )
+
+write_csv(
+  closest_removed_barrier_intervals,
+  file.path(out_dir, "closest_removed_barrier_intervals.csv")
+)
+
+saveRDS(
+  closest_removed_barrier_intervals,
+  file.path(out_dir, "closest_removed_barrier_intervals.rds")
+)
+
+
+#### 14. Effect sizes: pre sample to first post sample ############
+#### This version does NOT rely on safe_diff() or safe_log_ratio()
+closest_removed_barrier_effect_sizes <- closest_removed_barrier_intervals %>%
+  mutate(
+    effect_total_richness_diff =
+      post_total_richness - pre_total_richness,
+    
+    effect_total_richness_lnRR =
+      log((post_total_richness + 0.5) / (pre_total_richness + 0.5)),
+    
+    effect_shannon_diff =
+      post_shannon - pre_shannon,
+    
+    effect_shannon_lnRR =
+      log((post_shannon + 0.01) / (pre_shannon + 0.01)),
+    
+    effect_prop_non_native_diff =
+      post_prop_non_native - pre_prop_non_native,
+    
+    effect_non_native_count_diff =
+      post_n_non_native_taxa - pre_n_non_native_taxa,
+    
+    event_id = paste(
+      site_id,
+      matched_removal_id,
+      pre_year,
+      post_year,
+      sep = "_"
+    )
+  )
+
+write_csv(
+  closest_removed_barrier_effect_sizes,
+  file.path(out_dir, "closest_removed_barrier_effect_sizes.csv")
+)
+
+saveRDS(
+  closest_removed_barrier_effect_sizes,
+  file.path(out_dir, "closest_removed_barrier_effect_sizes.rds")
+)
+
+cat("\nEffect-size dataset created and saved.\n")
+cat("Rows:", nrow(closest_removed_barrier_effect_sizes), "\n")
+
+
+#### 15. Recovery trajectories ###################################
+#### For every site-removal event, keep all community samples after
+#### removal until the next removal at that site.
+####
+#### This lets you model recovery through time since removal.
+#### If another removal occurs, the previous recovery trajectory is censored.
+site_removal_events <- site_removed_barriers %>%
+  arrange(site_id, YearRemoved, min_distance_m) %>%
+  group_by(site_id) %>%
+  mutate(
+    removal_event_order = row_number(),
+    next_removal_year = lead(YearRemoved),
+    previous_removal_year = lag(YearRemoved),
+    cumulative_removals_before = row_number() - 1
+  ) %>%
+  ungroup() %>%
+  mutate(
+    removal_event_id = paste(site_id, matched_removal_id, YearRemoved, sep = "_")
+  )
+
+recovery_trajectories <- site_removal_events %>%
+  select(
+    site_id,
+    removal_event_id,
+    matched_removal_id,
+    AMBER_ID,
+    YearRemoved,
+    removal_type_reduced,
+    min_distance_m,
+    best_rank_observed,
+    removal_event_order,
+    previous_removal_year,
+    next_removal_year,
+    cumulative_removals_before
+  ) %>%
+  left_join(
+    community_samples_with_closest %>%
+      select(
+        site_id,
+        community_id,
+        sample_year,
+        country,
+        method,
+        HYBAS_ID,
+        HYRIV_ID,
+        MAIN_RIV,
+        total_richness,
+        shannon,
+        prop_non_native,
+        total_known_taxa,
+        n_non_native_taxa
+      ),
+    by = "site_id",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    years_since_removal = sample_year - YearRemoved,
+    before_after = case_when(
+      years_since_removal < 0 ~ "before",
+      years_since_removal == 0 ~ "year_of_removal",
+      years_since_removal > 0 ~ "after"
+    ),
+    censored_by_next_removal = !is.na(next_removal_year) &
+      sample_year >= next_removal_year
+  ) %>%
+  filter(
+    sample_year >= YearRemoved,
+    is.na(next_removal_year) | sample_year < next_removal_year
+  ) %>%
+  arrange(site_id, removal_event_order, sample_year)
+
+write_csv(
+  recovery_trajectories,
+  file.path(out_dir, "closest_removed_barrier_recovery_trajectories.csv")
+)
+
+saveRDS(
+  recovery_trajectories,
+  file.path(out_dir, "closest_removed_barrier_recovery_trajectories.rds")
+)
+
+
+#### 16. Summaries ###############################################
+summary_event_data <- list(
+  
+  amber_dre_matching = list(
+    n_dre_removals_snapped = n_distinct(dre_position_df$removal_id),
+    n_amber_barriers_snapped = n_distinct(amber_position_df$AMBER_ID),
+    n_dre_matched_to_amber_within_1km =
+      n_distinct(amber_dre_best_match$removal_id),
+    n_removed_amber_barriers =
+      n_distinct(removed_amber_barriers$AMBER_ID)
+  ),
+  
+  closest_barrier_status = community_samples_with_closest %>%
+    summarise(
+      n_community_samples = n(),
+      n_with_closest_overall_barrier =
+        sum(!is.na(closest_overall_AMBER_ID)),
+      n_where_closest_overall_was_removed =
+        sum(closest_overall_was_removed, na.rm = TRUE),
+      n_with_any_removed_barrier =
+        sum(!is.na(closest_removed_AMBER_ID)),
+      median_rank_of_closest_removed_barrier =
+        median(closest_removed_barrier_rank, na.rm = TRUE)
+    ),
+  
+  event_intervals = closest_removed_barrier_effect_sizes %>%
+    summarise(
+      n_effect_size_events = n(),
+      n_sites = n_distinct(site_id),
+      n_removals = n_distinct(matched_removal_id),
+      n_single_removal_intervals = sum(single_removal_interval),
+      n_multiple_removal_intervals = sum(multiple_removals_interval),
+      median_years_between_samples =
+        median(years_between_samples, na.rm = TRUE),
+      median_years_post_after_removal =
+        median(years_post_after_removal, na.rm = TRUE)
+    ),
+  
+  events_by_type = closest_removed_barrier_effect_sizes %>%
+    count(removal_type_reduced, sort = TRUE),
+  
+  recovery = recovery_trajectories %>%
+    summarise(
+      n_recovery_rows = n(),
+      n_sites = n_distinct(site_id),
+      n_removal_events = n_distinct(removal_event_id),
+      max_years_since_removal = max(years_since_removal, na.rm = TRUE),
+      median_years_since_removal = median(years_since_removal, na.rm = TRUE)
+    )
+)
+
+saveRDS(
+  summary_event_data,
+  file.path(out_dir, "summary_event_data_list.rds")
+)
+
+cat("\n--- AMBER-DRE matching summary ---\n")
+print(summary_event_data$amber_dre_matching)
+
+cat("\n--- Closest barrier status summary ---\n")
+print(summary_event_data$closest_barrier_status)
+
+cat("\n--- Effect-size event interval summary ---\n")
+print(summary_event_data$event_intervals)
+
+cat("\n--- Events by removal type ---\n")
+print(summary_event_data$events_by_type)
+
+cat("\n--- Recovery trajectory summary ---\n")
+print(summary_event_data$recovery)
+
+cat("\nFinished closest removed barrier event-pair workflow.\n")
+cat("Outputs saved to:", out_dir, "\n")
+
+
+
+
+#### 04. CHECK AND REFINE CLOSEST REMOVED BARRIER EVENTS #########
+
+removed_amber_barriers <- readRDS(
+  file.path(out_dir, "amber_dre_matched_removed_barriers.rds")
+)
+
+community_amber_rankings <- readRDS(
+  file.path(out_dir, "community_amber_barrier_rankings.rds")
+)
+
+community_samples_with_closest <- readRDS(
+  file.path(out_dir, "community_samples_with_closest_barrier_status.rds")
+)
+
+closest_removed_barrier_intervals <- readRDS(
+  file.path(out_dir, "closest_removed_barrier_intervals.rds")
+)
+
+closest_removed_barrier_effect_sizes <- readRDS(
+  file.path(out_dir, "closest_removed_barrier_effect_sizes.rds")
+)
+
+recovery_trajectories <- readRDS(
+  file.path(out_dir, "closest_removed_barrier_recovery_trajectories.rds")
+)
+
+summary_event_data <- readRDS(
+  file.path(out_dir, "summary_event_data_list.rds")
+)
+
+summary_event_data
+
+
+
+
+
+
+
+
